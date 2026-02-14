@@ -58,29 +58,59 @@ Goals:
 ## Architecture
 
 ```mermaid
-flowchart LR
+flowchart TB
 
-User[User / Apps] --> API[OpenAI-Compatible API]
+User[User / Apps]
 
-API --> Agent[Agent Runtime Loop]
+subgraph API Layer
+API[OpenAI-Compatible API]
+end
 
-Agent --> Prompt[Prompt Builder]
-Agent --> Memory[Vector Memory]
-Agent --> Tools[Tool Router]
+subgraph Mantis Runtime
+Agent[Agent Runtime Loop]
+Prompt[Prompt Builder]
+Memory[Vector Memory]
+Tools[Tool Router]
+end
 
-Prompt --> LLM[OpenAI • Claude • Local LLM]
+subgraph Model Providers
+LLM[OPENAI • Claude • Local LLM]
+end
 
-Memory --> VectorDB[(Vector Database)]
+subgraph Memory Layer
+VectorDB[(Vector Database)]
+end
 
-Tools --> Python[Python Executor]
-Tools --> Browser[Browser Automation]
-Tools --> HTTP[HTTP / APIs]
+subgraph Tools
+Python[Python Executor]
+Browser[Browser Automation]
+HTTP[HTTP / APIs]
+end
+
+User --> API
+API --> Agent
+
+Agent --> Prompt
+Agent --> Memory
+Agent --> Tools
+
+Prompt --> LLM
+Memory --> VectorDB
+
+Tools --> Python
+Tools --> Browser
+Tools --> HTTP
 
 LLM --> Agent
 Python --> Agent
 Browser --> Agent
 HTTP --> Agent
 ```
+
+<p>Mantis is designed as a personal AI runtime.
+The system sits between users, tools, data, and model providers, enabling autonomous task execution with full control over models and integrations.</p>
+
+<a href='docs/diagrams/FULL_UML_Diagram.mermaid'>Full diagram</a>
 
 ---
 
