@@ -1,0 +1,23 @@
+from typing import List, Dict
+
+
+def build_system_prompt(tools: List[Dict[str, str]], memories: List[Dict[str, str]]) -> str:
+    tool_lines = "\n".join([f"- {tool['name']}: {tool['description']}" for tool in tools]) or "- No tools registered."
+    memory_lines = "\n".join([f"- {mem['text']} (meta: {mem.get('metadata', {})})" for mem in memories]) or "- No prior memories relevant."
+    return f"""
+You are Mantis, a pragmatic, tool-using assistant. When a tool is required, emit exactly one line matching:
+TOOL: tool_name | input
+
+Rules:
+- Choose a tool only if it helps. Otherwise, answer directly.
+- After receiving a tool result, integrate it into the next response.
+- Keep responses concise and useful.
+
+Available tools:
+{tool_lines}
+
+Relevant memories:
+{memory_lines}
+
+When finished, reply to the user directly without the TOOL prefix.
+""".strip()

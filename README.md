@@ -28,6 +28,33 @@ Bring your own model. Run your own agent. Own your AI stack.
 
 ---
 
+## Quick start
+
+```bash
+pip install -r requirements.txt
+ollama pull qwen2.5:7b-instruct
+uvicorn app:app --reload --port 8001
+```
+
+Then connect the React UI to `http://localhost:8001/v1/chat/completions`.
+Open docs at `http://localhost:8001/docs`.
+
+Defaults:
+- Ollama endpoint: `http://localhost:11434` (override with `OLLAMA_BASE_URL`)
+- Model: `qwen2.5:7b-instruct` (override with `OLLAMA_MODEL`)
+- Vector memory path: `.mantis/chroma` (override with `MANTIS_CHROMA_DIR`)
+
+Tool calls: the agent emits `TOOL: tool_name | input`. Supported tools in the MVP are `python` (executes Python code locally — WARNING: full system access) and `http` (fetches a URL and returns the first ~2000 chars of cleaned text).
+
+Try this to validate loop + tools:
+```bash
+curl -X POST http://localhost:8001/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"mantis-local-agent","messages":[{"role":"user","content":"fetch https://example.com and summarize it"}]}'
+```
+
+---
+
 ## Why Mantis exists
 
 Most AI products today are:
