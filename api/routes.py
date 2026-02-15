@@ -11,7 +11,7 @@ from storage.vectordb import VectorStore
 from tools.registry import ToolRegistry
 
 router = APIRouter()
-logger = logging.getLogger("mantis")
+logger = logging.getLogger("mantis.api")
 
 # Instantiate core runtime components once for the app lifecycle.
 vector_store = VectorStore()

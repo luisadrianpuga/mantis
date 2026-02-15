@@ -31,7 +31,6 @@ Bring your own model. Run your own agent. Own your AI stack.
 ## Quick start
 ```bash
 pip install -r requirements.txt
-ollama pull qwen2.5:7b-instruct
 uvicorn app:app --reload --port 8001
 ```
 
@@ -39,8 +38,8 @@ Then connect the React UI to `http://localhost:8001/v1/chat/completions`.
 Open docs at `http://localhost:8001/docs`.
 
 Defaults:
-- Ollama endpoint: `http://localhost:11434` (override with `OLLAMA_BASE_URL`)
-- Model: `qwen2.5:7b-instruct` (override with `OLLAMA_MODEL`)
+- Provider auto-detection order: OpenAI -> Anthropic -> Ollama
+- Optional explicit model override: `MANTIS_MODEL`
 - Vector memory path: `.mantis/chroma` (override with `MANTIS_CHROMA_DIR`)
 
 Tool calls: the agent emits `TOOL: tool_name | input`. Supported tools in the MVP are `python` (executes Python code locally — WARNING: full system access) and `http` (fetches a URL and returns the first ~2000 chars of cleaned text).
@@ -60,6 +59,28 @@ cp .env.example .env
 bash scripts/install.sh
 python mantis.py chat
 ```
+
+## Cloud Mode (No Ollama)
+```bash
+pip install -r requirements.txt
+export OPENAI_API_KEY=your_key_here
+python mantis.py api
+```
+
+## Local Mode (Ollama)
+```bash
+ollama serve
+ollama pull qwen2.5:7b-instruct
+python mantis.py worker
+```
+
+## Hybrid Mode
+Mantis routes by model prefix:
+- `gpt*` -> OpenAI
+- `claude*` -> Anthropic
+- anything else -> Ollama
+
+You can run all providers together and select per-request with the `model` field.
 
 ---
 

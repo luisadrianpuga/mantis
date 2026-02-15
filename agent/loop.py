@@ -64,7 +64,7 @@ class AgentLoop:
         Detects TOOL: tool_name | input pattern.
         """
         for line in text.splitlines():
-            match = re.match(r"TOOL:\s*([\w-]+)\s*\|\s*(.+)", line.strip())
+            match = re.match(r"^TOOL:\s*([\w\.-]+)\s*\|\s*(.*)$", line.strip())
             if match:
                 return match.group(1), match.group(2)
         return None

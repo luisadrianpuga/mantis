@@ -5,6 +5,7 @@ import sys
 
 from agent.loop import AgentLoop
 from agent.memory import MemoryManager
+from providers.detection import has_anthropic, has_ollama, has_openai
 from providers.router import ProviderRouter
 from storage.vectordb import VectorStore
 from tools.registry import ToolRegistry
@@ -91,14 +92,18 @@ def _print_first_run_banner(workspace: str) -> None:
     print("Memory initialized.")
 
 
-def _print_worker_health_banner(default_model: str) -> None:
+def _print_worker_health_banner(default_model: str | None) -> None:
     safe_mode = _env_bool("MANTIS_SAFE_MODE", default=True)
     dangerous_enabled = _env_bool("MANTIS_APPROVE_DANGEROUS", default=False) and not safe_mode
 
     print("🪲 Mantis Worker running (autonomous mode)")
     print(f"Safety mode: {'ON' if safe_mode else 'OFF'}")
     print(f"Dangerous tools: {'ENABLED' if dangerous_enabled else 'DISABLED'}")
-    print(f"Provider default: {default_model}")
+    print(f"Provider default: {default_model or 'None detected'}")
+    print("Providers detected:")
+    print(f"OpenAI: {'YES' if has_openai() else 'NO'}")
+    print(f"Anthropic: {'YES' if has_anthropic() else 'NO'}")
+    print(f"Ollama: {'YES' if has_ollama() else 'NO'}")
     print("Memory location: .mantis/")
 
 
