@@ -17,16 +17,18 @@ def main() -> None:
         asyncio.run(worker_main())
 
     elif args.command == "chat":
+        from identity.bootstrap import bootstrap_identity
         from providers.router import ProviderRouter
         from tools.registry import ToolRegistry
         from storage.vectordb import VectorStore
         from agent.memory import MemoryManager
         from agent.loop import AgentLoop
 
+        identity = bootstrap_identity()
         router = ProviderRouter()
         tools = ToolRegistry()
         memory = MemoryManager(VectorStore())
-        agent = AgentLoop(router, tools, memory)
+        agent = AgentLoop(router, tools, memory, identity=identity)
 
         while True:
             try:

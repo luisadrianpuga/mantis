@@ -5,6 +5,8 @@ import sys
 
 from agent.loop import AgentLoop
 from agent.memory import MemoryManager
+from identity.bootstrap import bootstrap_identity
+from identity.manager import IdentityManager
 from providers.detection import has_anthropic, has_ollama, has_openai
 from providers.router import ProviderRouter
 from storage.vectordb import VectorStore
@@ -114,11 +116,12 @@ async def main() -> None:
     _configure_logging()
 
     try:
+        identity: IdentityManager = bootstrap_identity(workspace=os.getcwd())
         vector_store = VectorStore()
         memory_manager = MemoryManager(vector_store)
         tool_registry = ToolRegistry()
         provider_router = ProviderRouter()
-        agent_loop = AgentLoop(provider_router, tool_registry, memory_manager)
+        agent_loop = AgentLoop(provider_router, tool_registry, memory_manager, identity=identity)
 
         scheduler = Scheduler(get_default_jobs())
 
@@ -132,7 +135,7 @@ async def main() -> None:
                 jobs = scheduler.due_jobs()
                 for job in jobs:
                     logger.info("Running job: %s", job.name)
-                    await run_job(agent_loop, job)
+                    await run_job(agent_loop, job, identity=identity)
             except Exception as exc:  # pragma: no cover - long-running guard
                 logger.exception("Worker loop encountered an error: %s", exc)
 

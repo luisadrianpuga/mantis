@@ -6,6 +6,7 @@ from pydantic import BaseModel
 
 from agent.loop import AgentLoop
 from agent.memory import MemoryManager
+from identity.bootstrap import bootstrap_identity
 from providers.router import ProviderRouter
 from storage.vectordb import VectorStore
 from tools.registry import ToolRegistry
@@ -18,7 +19,8 @@ vector_store = VectorStore()
 memory_manager = MemoryManager(vector_store)
 tool_registry = ToolRegistry()
 provider_router = ProviderRouter()
-agent_loop = AgentLoop(provider_router, tool_registry, memory_manager)
+identity_manager = bootstrap_identity()
+agent_loop = AgentLoop(provider_router, tool_registry, memory_manager, identity=identity_manager)
 
 
 class Message(BaseModel):
@@ -36,6 +38,11 @@ async def list_models():
     return {"data": [{"id": "mantis-local-agent"}]}
 
 
+@router.get("/v1/identity")
+async def get_identity():
+    return identity_manager.get_identity_sections(recent_lines=20)
+
+
 @router.post("/v1/chat/completions")
 async def chat_completions(payload: ChatRequest):
     logger.info("Incoming chat request with %d messages", len(payload.messages))
@@ -45,3 +52,7 @@ async def chat_completions(payload: ChatRequest):
     )
     logger.info("Agent reply generated")
     return {"choices": [{"message": {"role": "assistant", "content": reply}}]}
+
+
+def bootstrap_runtime_identity() -> None:
+    bootstrap_identity()

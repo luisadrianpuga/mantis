@@ -3,6 +3,7 @@ import os
 from datetime import datetime
 
 from agent.loop import AgentLoop
+from identity.manager import IdentityManager
 from worker.scheduler import Job
 
 logger = logging.getLogger("mantis.worker")
@@ -24,7 +25,7 @@ def _summarize_result(result: str, max_length: int = 500) -> str:
     return single_line[: max_length - 3] + "..."
 
 
-async def run_job(agent: AgentLoop, job: Job) -> str:
+async def run_job(agent: AgentLoop, job: Job, identity: IdentityManager | None = None) -> str:
     messages = [
         {"role": "system", "content": "You are running an autonomous scheduled task."},
         {"role": "user", "content": job.description},
@@ -41,5 +42,11 @@ async def run_job(agent: AgentLoop, job: Job) -> str:
         file_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
         logger.addHandler(file_handler)
     logger.info("%s | %s", job.name, _summarize_result(result))
+
+    if identity:
+        summary = _summarize_result(result, max_length=240)
+        identity.append_journal(f"Completed job '{job.name}'. Summary: {summary}")
+        if job.name == "self_reflection":
+            identity.append_journal(result)
 
     return result

@@ -1,6 +1,7 @@
 import re
 from typing import Dict, List, Optional, Tuple
 
+from identity.manager import IdentityManager
 from agent.memory import MemoryManager
 from agent.prompt import build_system_prompt
 from tools.registry import ToolRegistry
@@ -21,11 +22,13 @@ class AgentLoop:
         llm_client,
         tools: ToolRegistry,
         memory: MemoryManager,
+        identity: IdentityManager | None = None,
         max_iterations: int = 5,
     ) -> None:
         self.llm = llm_client
         self.tools = tools
         self.memory = memory
+        self.identity = identity
         self.max_iterations = max_iterations
 
     async def run(self, messages: List[Dict[str, str]] | str, model: str | None = None) -> str:
@@ -34,7 +37,8 @@ class AgentLoop:
 
         latest_user_message = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
         memories = self.memory.retrieve_memory(latest_user_message) if latest_user_message else []
-        system_prompt = build_system_prompt(self.tools.list_tools(), memories)
+        identity_block = self.identity.load_identity_block() if self.identity else ""
+        system_prompt = build_system_prompt(self.tools.list_tools(), memories, identity_block)
         conversation: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}] + messages
 
         for _ in range(self.max_iterations):

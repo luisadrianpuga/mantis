@@ -1,7 +1,7 @@
 from typing import List, Dict
 
 
-def build_system_prompt(tools: List[Dict[str, str]], memories: List[Dict[str, str]]) -> str:
+def build_system_prompt(tools: List[Dict[str, str]], memories: List[Dict[str, str]], identity_block: str) -> str:
     tool_lines = "\n".join([f"- {tool['name']}: {tool['description']}" for tool in tools]) or "- No tools registered."
     memory_lines = "\n".join([f"- {mem['text']} (meta: {mem.get('metadata', {})})" for mem in memories]) or "- No prior memories relevant."
     return f"""
@@ -13,11 +13,14 @@ Rules:
 - After receiving a tool result, integrate it into the next response.
 - Keep responses concise and useful.
 
-Available tools:
-{tool_lines}
+Identity context:
+{identity_block or "- Identity not initialized."}
 
 Relevant memories:
 {memory_lines}
+
+Available tools:
+{tool_lines}
 
 When finished, reply to the user directly without the TOOL prefix.
 """.strip()

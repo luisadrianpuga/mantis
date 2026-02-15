@@ -5,7 +5,12 @@ def get_default_jobs() -> list[Job]:
     return [
         Job(
             name="self_reflection",
-            description="Reflect on recent memories and summarize important things.",
+            description=(
+                "Reflect on recent activity and produce a short journal entry describing:\n"
+                "- what happened\n"
+                "- what was learned\n"
+                "- what should improve next"
+            ),
             interval_seconds=30 * 60,
         ),
         Job(
