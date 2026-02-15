@@ -44,9 +44,10 @@ async def run_job(agent: AgentLoop, job: Job, identity: IdentityManager | None =
     logger.info("%s | %s", job.name, _summarize_result(result))
 
     if identity:
-        summary = _summarize_result(result, max_length=240)
-        identity.append_journal(f"Completed job '{job.name}'. Summary: {summary}")
         if job.name == "self_reflection":
             identity.append_journal(result)
+        else:
+            summary = _summarize_result(result, max_length=240)
+            identity.append_journal(f"Completed job '{job.name}'. Summary: {summary}")
 
     return result

@@ -52,7 +52,3 @@ async def chat_completions(payload: ChatRequest):
     )
     logger.info("Agent reply generated")
     return {"choices": [{"message": {"role": "assistant", "content": reply}}]}
-
-
-def bootstrap_runtime_identity() -> None:
-    bootstrap_identity()

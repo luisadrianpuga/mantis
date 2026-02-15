@@ -7,7 +7,7 @@ from agent.loop import AgentLoop
 from agent.memory import MemoryManager
 from identity.bootstrap import bootstrap_identity
 from identity.manager import IdentityManager
-from providers.detection import has_anthropic, has_ollama, has_openai
+from providers.detection import has_anthropic, has_ollama, has_openai, has_openai_compat
 from providers.router import ProviderRouter
 from storage.vectordb import VectorStore
 from tools.registry import ToolRegistry
@@ -101,11 +101,25 @@ def _print_worker_health_banner(default_model: str | None) -> None:
     print("🪲 Mantis Worker running (autonomous mode)")
     print(f"Safety mode: {'ON' if safe_mode else 'OFF'}")
     print(f"Dangerous tools: {'ENABLED' if dangerous_enabled else 'DISABLED'}")
-    print(f"Provider default: {default_model or 'None detected'}")
-    print("Providers detected:")
-    print(f"OpenAI: {'YES' if has_openai() else 'NO'}")
+    print(f"Default model: {default_model or 'None detected'}")
+
+    print("\nProviders detected:")
+    print(f"Local OpenAI-compatible: {'YES' if has_openai_compat() else 'NO'}")
+    print(f"OpenAI cloud: {'YES' if has_openai() else 'NO'}")
     print(f"Anthropic: {'YES' if has_anthropic() else 'NO'}")
     print(f"Ollama: {'YES' if has_ollama() else 'NO'}")
+
+    if has_openai_compat():
+        print("\nActive provider: LOCAL LLM")
+    elif has_openai():
+        print("\nActive provider: OpenAI")
+    elif has_anthropic():
+        print("\nActive provider: Anthropic")
+    elif has_ollama():
+        print("\nActive provider: Ollama")
+    else:
+        print("\nActive provider: NONE")
+
     print("Memory location: .mantis/")
 
 

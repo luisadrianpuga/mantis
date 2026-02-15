@@ -2,10 +2,12 @@ import os
 from typing import Any, Dict, List
 
 import httpx
-from providers.detection import has_anthropic, has_ollama, has_openai
+from providers.detection import has_anthropic, has_ollama, has_openai, has_openai_compat
 
 
 def _auto_detect_default_model() -> str | None:
+    if has_openai_compat():
+        return os.getenv("MANTIS_MODEL", "local-model")
     if has_openai():
         return os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     if has_anthropic():
@@ -26,6 +28,9 @@ class ProviderRouter:
 
     def __init__(self) -> None:
         self.default_model = os.getenv("MANTIS_MODEL") or _auto_detect_default_model()
+        self.openai_compat_base = os.getenv("MANTIS_BASE_URL")
+        self.openai_compat_key = os.getenv("MANTIS_API_KEY", "local")
+        self.request_timeout = float(os.getenv("MANTIS_TIMEOUT", "180"))
         self.ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
         self.openai_api_key = os.getenv("OPENAI_API_KEY", "")
         self.openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -35,13 +40,41 @@ class ProviderRouter:
     async def chat(self, messages: List[Dict[str, Any]], model: str | None = None) -> str:
         target_model = model or self.default_model
         if not target_model:
-            return "[Mantis error: No LLM provider configured. Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or install Ollama.]"
+            return "[Mantis error: No LLM detected. Start your local server or configure a cloud provider.]"
+
+        if self.openai_compat_base:
+            return await self._openai_compat_chat(messages, target_model)
+
         lowered = target_model.lower()
         if lowered.startswith("gpt"):
             return await self._openai_chat(messages, target_model)
         if lowered.startswith("claude"):
             return await self._anthropic_chat(messages, target_model)
         return await self._ollama_chat(messages, target_model)
+
+    async def _openai_compat_chat(self, messages: List[Dict[str, Any]], model: str) -> str:
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0.7,
+            "stream": False,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.openai_compat_key}",
+            "Content-Type": "application/json",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=self.request_timeout) as client:
+                response = await client.post(
+                    f"{self.openai_compat_base.rstrip('/')}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                )
+                response.raise_for_status()
+                data = response.json()
+                return data["choices"][0]["message"]["content"].strip()
+        except Exception as exc:
+            return f"[LLM error: {exc}]"
 
     async def _ollama_chat(self, messages: List[Dict[str, Any]], model: str) -> str:
         payload = {
