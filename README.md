@@ -29,7 +29,6 @@ Bring your own model. Run your own agent. Own your AI stack.
 ---
 
 ## Quick start
-
 ```bash
 pip install -r requirements.txt
 ollama pull qwen2.5:7b-instruct
