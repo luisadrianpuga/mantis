@@ -3,8 +3,7 @@ from typing import Dict, List, Optional, Tuple
 
 from agent.memory import MemoryManager
 from agent.prompt import build_system_prompt
-from permissions.policy import check_permission
-from providers.router import ProviderRouter
+from llm.ollama import OllamaClient
 from tools.registry import ToolRegistry
 
 
@@ -20,7 +19,7 @@ class AgentLoop:
 
     def __init__(
         self,
-        llm_client: ProviderRouter,
+        llm_client: OllamaClient,
         tools: ToolRegistry,
         memory: MemoryManager,
         max_iterations: int = 5,
@@ -30,10 +29,7 @@ class AgentLoop:
         self.memory = memory
         self.max_iterations = max_iterations
 
-    async def run(self, messages: List[Dict[str, str]] | str, model: str | None = None) -> str:
-        if isinstance(messages, str):
-            messages = [{"role": "user", "content": messages}]
-
+    async def run(self, messages: List[Dict[str, str]], model: str | None = None) -> str:
         latest_user_message = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
         memories = self.memory.retrieve_memory(latest_user_message) if latest_user_message else []
         system_prompt = build_system_prompt(self.tools.list_tools(), memories)
@@ -46,8 +42,6 @@ class AgentLoop:
             tool_call = self._parse_tool_call(reply)
             if tool_call:
                 tool_name, tool_input = tool_call
-                if not check_permission(tool_name):
-                    return "Tool requires approval."
                 conversation.append({"role": "assistant", "content": reply})
                 tool_result = await self.tools.run(tool_name, tool_input)
                 # Surface tool result back to the model as user content.
@@ -68,7 +62,7 @@ class AgentLoop:
         Detects TOOL: tool_name | input pattern.
         """
         for line in text.splitlines():
-            match = re.match(r"TOOL:\s*([\w\.-]+)\s*\|\s*(.+)", line.strip())
+            match = re.match(r"TOOL:\s*([\w-]+)\s*\|\s*(.+)", line.strip())
             if match:
                 return match.group(1), match.group(2)
         return None

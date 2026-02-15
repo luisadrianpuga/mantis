@@ -1,7 +1,7 @@
 import inspect
 from typing import Any, Callable, Dict, List
 
-from tools import filesystem, http, python_exec
+from tools import http, python_exec
 
 
 class ToolRegistry:
@@ -17,26 +17,6 @@ class ToolRegistry:
                 "description": "Fetch text content from a URL.",
                 "handler": http.fetch,
             },
-            "read_file": {
-                "name": "read_file",
-                "description": "Read a UTF-8 text file from the workspace.",
-                "handler": filesystem.read_file,
-            },
-            "write_file": {
-                "name": "write_file",
-                "description": "Write content to a file in the workspace. Input should include path and content.",
-                "handler": filesystem.write_file,
-            },
-            "list_files": {
-                "name": "list_files",
-                "description": "List files and directories under a workspace path.",
-                "handler": filesystem.list_files,
-            },
-            "search_files": {
-                "name": "search_files",
-                "description": "Search for text across files in the workspace.",
-                "handler": filesystem.search_files,
-            },
         }
 
     def list_tools(self) -> List[Dict[str, str]]:
@@ -47,9 +27,6 @@ class ToolRegistry:
         if not spec:
             return f"Unknown tool: {name}"
         handler: Callable = spec["handler"]
-        try:
-            if inspect.iscoroutinefunction(handler):
-                return await handler(tool_input)
-            return handler(tool_input)
-        except Exception as exc:  # pragma: no cover - defensive guardrail
-            return f"Tool execution error ({name}): {exc}"
+        if inspect.iscoroutinefunction(handler):
+            return await handler(tool_input)
+        return handler(tool_input)

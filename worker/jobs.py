@@ -4,28 +4,18 @@ from worker.scheduler import Job
 def get_default_jobs() -> list[Job]:
     return [
         Job(
-            name="task_planning",
-            description="Break goals into actionable tasks.",
+            name="self_reflection",
+            description="Reflect on recent memories and summarize important things.",
             interval_seconds=30 * 60,
         ),
         Job(
-            name="task_execution",
-            description="Execute the next pending task.",
-            interval_seconds=60,
-        ),
-        Job(
-            name="workspace_index",
-            description="Refresh repository understanding in memory.",
-            interval_seconds=6 * 60 * 60,
-        ),
-        Job(
-            name="journal",
-            description="Write a concise operational journal entry.",
-            interval_seconds=15 * 60,
-        ),
-        Job(
-            name="review_goals",
-            description="Review goal and task progress, then summarize.",
+            name="web_exploration",
+            description="Search the web for interesting AI or software engineering news.\nSummarize findings.",
             interval_seconds=60 * 60,
+        ),
+        Job(
+            name="workspace_cleanup",
+            description="Review stored memories and create a concise summary of long-term context.",
+            interval_seconds=6 * 60 * 60,
         ),
     ]
