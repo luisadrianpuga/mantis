@@ -52,6 +52,15 @@ curl -X POST http://localhost:8001/v1/chat/completions \
   -d '{"model":"mantis-local-agent","messages":[{"role":"user","content":"fetch https://example.com and summarize it"}]}'
 ```
 
+## Install
+```bash
+git clone <repo>
+cd mantis
+cp .env.example .env
+bash scripts/install.sh
+python mantis.py chat
+```
+
 ---
 
 ## Why Mantis exists

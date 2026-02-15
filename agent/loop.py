@@ -3,7 +3,6 @@ from typing import Dict, List, Optional, Tuple
 
 from agent.memory import MemoryManager
 from agent.prompt import build_system_prompt
-from llm.ollama import OllamaClient
 from tools.registry import ToolRegistry
 
 
@@ -19,7 +18,7 @@ class AgentLoop:
 
     def __init__(
         self,
-        llm_client: OllamaClient,
+        llm_client,
         tools: ToolRegistry,
         memory: MemoryManager,
         max_iterations: int = 5,
@@ -29,7 +28,10 @@ class AgentLoop:
         self.memory = memory
         self.max_iterations = max_iterations
 
-    async def run(self, messages: List[Dict[str, str]], model: str | None = None) -> str:
+    async def run(self, messages: List[Dict[str, str]] | str, model: str | None = None) -> str:
+        if isinstance(messages, str):
+            messages = [{"role": "user", "content": messages}]
+
         latest_user_message = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
         memories = self.memory.retrieve_memory(latest_user_message) if latest_user_message else []
         system_prompt = build_system_prompt(self.tools.list_tools(), memories)

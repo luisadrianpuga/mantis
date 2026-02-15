@@ -6,7 +6,7 @@ from pydantic import BaseModel
 
 from agent.loop import AgentLoop
 from agent.memory import MemoryManager
-from llm.ollama import OllamaClient
+from providers.router import ProviderRouter
 from storage.vectordb import VectorStore
 from tools.registry import ToolRegistry
 
@@ -17,8 +17,8 @@ logger = logging.getLogger("mantis")
 vector_store = VectorStore()
 memory_manager = MemoryManager(vector_store)
 tool_registry = ToolRegistry()
-ollama_client = OllamaClient()
-agent_loop = AgentLoop(ollama_client, tool_registry, memory_manager)
+provider_router = ProviderRouter()
+agent_loop = AgentLoop(provider_router, tool_registry, memory_manager)
 
 
 class Message(BaseModel):
