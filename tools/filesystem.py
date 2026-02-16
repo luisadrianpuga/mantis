@@ -4,10 +4,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-from config import MANTIS_ALLOW_FILE_WRITE
+from config import MANTIS_ALLOW_FILE_WRITE, MANTIS_SANDBOX
 
 CHANGE_LOG_DIR = Path(".mantis") / "changes"
 WORKSPACE_ROOT = Path(".").resolve()
+SANDBOX_ROOT = (WORKSPACE_ROOT / "workspace").resolve()
+DENYLIST = {
+    ".env",
+    ".git/config",
+}
 
 
 def _json_input(tool_input: str) -> Dict[str, Any]:
@@ -26,9 +31,22 @@ def _ensure_writes_allowed() -> None:
 
 
 def _resolve_path(path: str) -> Path:
+    normalized = path.strip()
+    if normalized in DENYLIST:
+        raise ValueError(f"Path is denied by policy: {path}")
+    if normalized.startswith("~/") or normalized == "~":
+        raise ValueError(f"Path is denied by policy: {path}")
+    if Path(normalized).is_absolute():
+        raise ValueError(f"Absolute paths are not allowed: {path}")
+
     candidate = (WORKSPACE_ROOT / path).resolve()
     if WORKSPACE_ROOT not in candidate.parents and candidate != WORKSPACE_ROOT:
         raise ValueError(f"Path escapes workspace root: {path}")
+    if MANTIS_SANDBOX:
+        if candidate == SANDBOX_ROOT:
+            return candidate
+        if SANDBOX_ROOT not in candidate.parents:
+            raise ValueError(f"Sandbox mode restricts writes to workspace/: {path}")
     return candidate
 
 

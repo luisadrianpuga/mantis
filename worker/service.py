@@ -12,8 +12,9 @@ from providers.router import ProviderRouter
 from storage.vectordb import VectorStore
 from tools.registry import ToolRegistry
 from worker.jobs import get_default_jobs
-from worker.runner import LOG_FILE, run_job, _ensure_log_dir
+from worker.runner import LOG_FILE, run_job, run_repo_discovery, _ensure_log_dir
 from worker.scheduler import Scheduler
+from worker.task_queue import TaskQueue
 
 logger = logging.getLogger("mantis.worker")
 PID_FILE = os.path.join(".mantis", "worker.pid")
@@ -123,6 +124,23 @@ def _print_worker_health_banner(default_model: str | None) -> None:
     print("Memory location: .mantis/")
 
 
+async def _ensure_tasks_exist(
+    agent_loop: AgentLoop,
+    identity: IdentityManager | None,
+    task_queue: TaskQueue,
+    default_model: str | None,
+) -> None:
+    """
+    If no pending tasks exist, trigger repo discovery immediately.
+    """
+    has_pending = any(item.get("status") == "pending" for item in task_queue.list_items())
+    if has_pending:
+        return
+
+    logger.info("Task queue empty -> triggering immediate repo discovery")
+    await run_repo_discovery(agent_loop, identity)
+
+
 async def main() -> None:
     first_run = not os.path.exists(".mantis")
 
@@ -138,14 +156,34 @@ async def main() -> None:
         agent_loop = AgentLoop(provider_router, tool_registry, memory_manager, identity=identity)
 
         scheduler = Scheduler(get_default_jobs())
+        task_queue = TaskQueue()
 
         if first_run:
             _print_first_run_banner(os.getcwd())
         _print_worker_health_banner(provider_router.default_model)
         logger.info("Worker booted with %d jobs", len(scheduler.jobs))
 
+        await _ensure_tasks_exist(agent_loop, identity, task_queue, provider_router.default_model)
+
+        resumed = await agent_loop.resume_running_plan(model=provider_router.default_model)
+        if resumed:
+            logger.info("Resumed unfinished plan: %s", resumed)
+
         while True:
             try:
+                await _ensure_tasks_exist(agent_loop, identity, task_queue, provider_router.default_model)
+                next_task = task_queue.next_pending()
+                if next_task:
+                    goal = next_task.get("goal", "")
+                    task_id = next_task.get("id", "")
+                    logger.info("Running queued task %s: %s", task_id, goal)
+                    result = await agent_loop.run(goal, model=provider_router.default_model)
+                    if "Reached iteration limit" in result or "failing" in result.lower():
+                        task_queue.set_status(task_id, "failed")
+                    else:
+                        task_queue.set_status(task_id, "done")
+                    continue
+
                 jobs = scheduler.due_jobs()
                 for job in jobs:
                     logger.info("Running job: %s", job.name)

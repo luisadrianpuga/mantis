@@ -21,6 +21,10 @@ class FakeTools:
         return [
             {"name": "write_file", "description": "..."},
             {"name": "run_tests", "description": "..."},
+            {"name": "git.status", "description": "..."},
+            {"name": "git.create_branch", "description": "..."},
+            {"name": "git.diff", "description": "..."},
+            {"name": "git.commit", "description": "..."},
         ]
 
     async def run(self, name, tool_input):
@@ -29,6 +33,14 @@ class FakeTools:
             return "Wrote file: app.py"
         if name == "run_tests":
             return "COMMAND: pytest -q\nEXIT_CODE: 0\nOUTPUT:\npassed"
+        if name == "git.status":
+            return " M app.py"
+        if name == "git.create_branch":
+            return "Checked out branch: mantis/test"
+        if name == "git.diff":
+            return "diff --git a/app.py b/app.py\n+print(1)"
+        if name == "git.commit":
+            return "[test] Mantis commit created"
         return "ok"
 
 
@@ -50,6 +62,7 @@ def test_agent_loop_project_goal_runs_tests_after_edits():
         [
             "PLAN:\n1. Modify source",  # planner output
             'TOOL: write_file | {"path":"app.py","content":"print(1)","overwrite":true}',
+            "yes",
             "Task 1 complete.",
             "All done. Tests are green.",
         ]
@@ -64,3 +77,4 @@ def test_agent_loop_project_goal_runs_tests_after_edits():
     tool_names = [name for name, _ in tools.calls]
     assert "write_file" in tool_names
     assert tool_names.count("run_tests") >= 2
+    assert "git.commit" in tool_names

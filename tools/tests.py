@@ -1,5 +1,6 @@
 import shutil
 import subprocess
+import os
 from pathlib import Path
 from typing import List
 
@@ -10,7 +11,10 @@ def run_tests(_: str = "") -> str:
         return "No supported test command detected (pytest, npm test, make test). EXIT_CODE: 127"
 
     try:
-        completed = subprocess.run(command, capture_output=True, text=True, check=False)
+        env = os.environ.copy()
+        if command and command[0] == "pytest":
+            env.setdefault("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+        completed = subprocess.run(command, capture_output=True, text=True, check=False, env=env)
     except Exception as exc:
         return f"Test execution failed: {exc}. EXIT_CODE: 1"
 

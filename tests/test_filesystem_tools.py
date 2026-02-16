@@ -5,6 +5,8 @@ from tools import filesystem
 
 def test_write_blocked_when_flag_disabled(tmp_path, monkeypatch):
     monkeypatch.setattr(filesystem, "WORKSPACE_ROOT", tmp_path)
+    monkeypatch.setattr(filesystem, "SANDBOX_ROOT", tmp_path / "workspace")
+    monkeypatch.setattr(filesystem, "MANTIS_SANDBOX", False)
     monkeypatch.setattr(filesystem, "MANTIS_ALLOW_FILE_WRITE", False)
 
     payload = json.dumps({"path": "a.txt", "content": "hi", "overwrite": True})
@@ -15,6 +17,8 @@ def test_write_blocked_when_flag_disabled(tmp_path, monkeypatch):
 
 def test_create_patch_delete_with_change_logs(tmp_path, monkeypatch):
     monkeypatch.setattr(filesystem, "WORKSPACE_ROOT", tmp_path)
+    monkeypatch.setattr(filesystem, "SANDBOX_ROOT", tmp_path / "workspace")
+    monkeypatch.setattr(filesystem, "MANTIS_SANDBOX", False)
     monkeypatch.setattr(filesystem, "CHANGE_LOG_DIR", tmp_path / ".mantis" / "changes")
     monkeypatch.setattr(filesystem, "MANTIS_ALLOW_FILE_WRITE", True)
 
@@ -30,3 +34,14 @@ def test_create_patch_delete_with_change_logs(tmp_path, monkeypatch):
 
     change_logs = list((tmp_path / ".mantis" / "changes").glob("*.json"))
     assert len(change_logs) == 3
+
+
+def test_sandbox_blocks_non_workspace_writes(tmp_path, monkeypatch):
+    monkeypatch.setattr(filesystem, "WORKSPACE_ROOT", tmp_path)
+    monkeypatch.setattr(filesystem, "SANDBOX_ROOT", tmp_path / "workspace")
+    monkeypatch.setattr(filesystem, "MANTIS_SANDBOX", True)
+    monkeypatch.setattr(filesystem, "MANTIS_ALLOW_FILE_WRITE", True)
+
+    payload = json.dumps({"path": "outside.txt", "content": "blocked", "overwrite": True})
+    result = filesystem.write_file(payload)
+    assert "Sandbox mode restricts writes" in result

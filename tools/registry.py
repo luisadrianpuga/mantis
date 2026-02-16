@@ -3,6 +3,8 @@ from typing import Any, Callable, Dict, List
 
 from tools import http, python_exec
 from tools import workspace_tools, filesystem, tests
+from tools import git_tools
+from tools import repo_snapshot
 
 
 class ToolRegistry:
@@ -33,6 +35,11 @@ class ToolRegistry:
                 "description": "Search workspace paths and text content. Input: query string.",
                 "handler": workspace_tools.search,
             },
+            "workspace.snapshot": {
+                "name": "workspace.snapshot",
+                "description": "Return condensed repository intelligence (tree, commits, tests, TODOs, README).",
+                "handler": repo_snapshot.snapshot,
+            },
             "create_file": {
                 "name": "create_file",
                 "description": "Create a new file. Input JSON: {\"path\":\"...\",\"content\":\"...\"}.",
@@ -57,6 +64,36 @@ class ToolRegistry:
                 "name": "run_tests",
                 "description": "Auto-detect and execute tests (pytest, npm test, make test). Input can be empty.",
                 "handler": tests.run_tests,
+            },
+            "git.status": {
+                "name": "git.status",
+                "description": "Return git porcelain status for the current repository.",
+                "handler": git_tools.status,
+            },
+            "git.create_branch": {
+                "name": "git.create_branch",
+                "description": "Create and checkout a branch. Input JSON: {\"name\":\"...\"} or {\"goal\":\"...\"}.",
+                "handler": git_tools.create_branch,
+            },
+            "git.commit": {
+                "name": "git.commit",
+                "description": "Commit local staged changes. Input JSON: {\"message\":\"...\"}.",
+                "handler": git_tools.commit,
+            },
+            "git.diff": {
+                "name": "git.diff",
+                "description": "Show working tree diff or diff preview. Input can be empty or JSON.",
+                "handler": git_tools.diff,
+            },
+            "git.checkout": {
+                "name": "git.checkout",
+                "description": "Checkout a local branch/target. Input JSON: {\"target\":\"...\"}.",
+                "handler": git_tools.checkout,
+            },
+            "git.log": {
+                "name": "git.log",
+                "description": "Show recent commit history. Input JSON: {\"n\":10}.",
+                "handler": git_tools.log,
             },
         }
 

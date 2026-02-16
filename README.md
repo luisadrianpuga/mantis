@@ -22,6 +22,7 @@ Bring your own model. Run your own agent. Own your AI stack.
 * Works with **OpenAI, Claude, or Local LLMs**
 * Autonomous agent loop
 * Planner-first project execution for repo-level goals
+* Git-native dev workflow (branch, diff, commit)
 * Tool orchestration system
 * Vector memory (RAG)
 * Runs fully local if desired
@@ -46,15 +47,21 @@ Defaults:
 Tool calls: the agent emits `TOOL: tool_name | input`.
 
 Runtime toolset includes:
-- Workspace awareness: `workspace.tree`, `workspace.read_file`, `workspace.search`
+- Workspace awareness: `workspace.tree`, `workspace.read_file`, `workspace.search`, `workspace.snapshot`
 - Code editing: `create_file`, `write_file`, `patch_file`, `delete_file`
 - Validation: `run_tests` (auto-detects `pytest`, `npm test`, `make test`)
+- Git tools: `git.status`, `git.create_branch`, `git.diff`, `git.checkout`, `git.log`, `git.commit`
 - Utility: `python`, `http`
 
 Safety controls:
 - `MANTIS_DEV_MODE=true` enables planner-driven project loops.
 - `MANTIS_ALLOW_FILE_WRITE=false` by default disables file mutation tools.
+- `MANTIS_SANDBOX=true` restricts file writes to `./workspace/`.
 - All successful file mutations are logged to `.mantis/changes/`.
+- Resumable plans are persisted in `.mantis/plans/`.
+- Task queue is persisted in `.mantis/queue.json`.
+- Execution metrics are appended to `.mantis/metrics.jsonl`.
+- Worker includes autonomous repo task discovery and enqueues goals without user prompts.
 
 Try this to validate loop + tools:
 ```bash

@@ -2,8 +2,10 @@ import logging
 import os
 from datetime import datetime
 
+from agent.repo_analyzer import RepoAnalyzer
 from agent.loop import AgentLoop
 from identity.manager import IdentityManager
+from worker.task_queue import TaskQueue
 from worker.scheduler import Job
 
 logger = logging.getLogger("mantis.worker")
@@ -26,6 +28,12 @@ def _summarize_result(result: str, max_length: int = 500) -> str:
 
 
 async def run_job(agent: AgentLoop, job: Job, identity: IdentityManager | None = None) -> str:
+    if job.name == "repo_task_discovery":
+        result = await run_repo_discovery(agent, identity)
+        _log_job_result(job.name, result)
+        agent.memory.store_memory(result, {"source": "worker", "job": job.name, "ran_at": datetime.utcnow().isoformat()})
+        return result
+
     messages = [
         {"role": "system", "content": "You are running an autonomous scheduled task."},
         {"role": "user", "content": job.description},
@@ -35,13 +43,7 @@ async def run_job(agent: AgentLoop, job: Job, identity: IdentityManager | None =
     # Persist the result to long-term memory with job metadata.
     agent.memory.store_memory(result, {"source": "worker", "job": job.name, "ran_at": datetime.utcnow().isoformat()})
 
-    # Log to disk in the required format.
-    _ensure_log_dir()
-    if not any(isinstance(handler, logging.FileHandler) and handler.baseFilename == os.path.abspath(LOG_FILE) for handler in logger.handlers):
-        file_handler = logging.FileHandler(LOG_FILE)
-        file_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
-        logger.addHandler(file_handler)
-    logger.info("%s | %s", job.name, _summarize_result(result))
+    _log_job_result(job.name, result)
 
     if identity:
         if job.name == "self_reflection":
@@ -51,3 +53,35 @@ async def run_job(agent: AgentLoop, job: Job, identity: IdentityManager | None =
             identity.append_journal(f"Completed job '{job.name}'. Summary: {summary}")
 
     return result
+
+
+async def run_repo_discovery(agent: AgentLoop, identity: IdentityManager | None = None) -> str:
+    snapshot = await agent.tools.run("workspace.snapshot", "")
+    analyzer = RepoAnalyzer(agent.llm)
+    goals = await analyzer.discover_goals(snapshot)
+
+    queue = TaskQueue()
+    enqueued = 0
+    for goal in goals:
+        goal = goal.strip()
+        if not goal:
+            continue
+        if queue.has_goal(goal):
+            continue
+        queue.enqueue(goal)
+        enqueued += 1
+
+    if identity:
+        identity.append_journal("Discovered new development tasks.")
+
+    return f"Task discovery completed. Enqueued {enqueued} tasks."
+
+
+def _log_job_result(job_name: str, result: str) -> None:
+    # Log to disk in the required format.
+    _ensure_log_dir()
+    if not any(isinstance(handler, logging.FileHandler) and handler.baseFilename == os.path.abspath(LOG_FILE) for handler in logger.handlers):
+        file_handler = logging.FileHandler(LOG_FILE)
+        file_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
+        logger.addHandler(file_handler)
+    logger.info("%s | %s", job_name, _summarize_result(result))

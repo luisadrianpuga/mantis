@@ -4,6 +4,11 @@ from worker.scheduler import Job
 def get_default_jobs() -> list[Job]:
     return [
         Job(
+            name="repo_task_discovery",
+            description="Analyze repository and enqueue development tasks.",
+            interval_seconds=60 * 10,
+        ),
+        Job(
             name="self_reflection",
             description=(
                 "Reflect on recent activity and produce a short journal entry describing:\n"
