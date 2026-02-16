@@ -21,6 +21,7 @@ Bring your own model. Run your own agent. Own your AI stack.
 * OpenAI-compatible API
 * Works with **OpenAI, Claude, or Local LLMs**
 * Autonomous agent loop
+* Planner-first project execution for repo-level goals
 * Tool orchestration system
 * Vector memory (RAG)
 * Runs fully local if desired
@@ -42,7 +43,18 @@ Defaults:
 - Optional explicit model override: `MANTIS_MODEL`
 - Vector memory path: `.mantis/chroma` (override with `MANTIS_CHROMA_DIR`)
 
-Tool calls: the agent emits `TOOL: tool_name | input`. Supported tools in the MVP are `python` (executes Python code locally — WARNING: full system access) and `http` (fetches a URL and returns the first ~2000 chars of cleaned text).
+Tool calls: the agent emits `TOOL: tool_name | input`.
+
+Runtime toolset includes:
+- Workspace awareness: `workspace.tree`, `workspace.read_file`, `workspace.search`
+- Code editing: `create_file`, `write_file`, `patch_file`, `delete_file`
+- Validation: `run_tests` (auto-detects `pytest`, `npm test`, `make test`)
+- Utility: `python`, `http`
+
+Safety controls:
+- `MANTIS_DEV_MODE=true` enables planner-driven project loops.
+- `MANTIS_ALLOW_FILE_WRITE=false` by default disables file mutation tools.
+- All successful file mutations are logged to `.mantis/changes/`.
 
 Try this to validate loop + tools:
 ```bash
