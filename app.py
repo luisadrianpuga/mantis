@@ -13,6 +13,7 @@ from api.routes import router
 
 app = FastAPI(title="Mantis Runtime", version=MANTIS_VERSION)
 
+
 @app.get("/")
 def health():
     return {"status": "ok", "version": MANTIS_VERSION}

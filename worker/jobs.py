@@ -4,8 +4,26 @@ from worker.scheduler import Job
 def get_default_jobs() -> list[Job]:
     return [
         Job(
+            name="repo_task_discovery",
+            description="Analyze repository and enqueue development tasks.",
+            interval_seconds=60 * 10,
+        ),
+        Job(
+            name="idle_improvement",
+            description=(
+                "No tasks are pending. Review the repository snapshot and "
+                "propose one small improvement task to enqueue."
+            ),
+            interval_seconds=60 * 20,
+        ),
+        Job(
             name="self_reflection",
-            description="Reflect on recent memories and summarize important things.",
+            description=(
+                "Reflect on recent activity and produce a short journal entry describing:\n"
+                "- what happened\n"
+                "- what was learned\n"
+                "- what should improve next"
+            ),
             interval_seconds=30 * 60,
         ),
         Job(

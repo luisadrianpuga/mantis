@@ -21,6 +21,8 @@ Bring your own model. Run your own agent. Own your AI stack.
 * OpenAI-compatible API
 * Works with **OpenAI, Claude, or Local LLMs**
 * Autonomous agent loop
+* Planner-first project execution for repo-level goals
+* Git-native dev workflow (branch, diff, commit)
 * Tool orchestration system
 * Vector memory (RAG)
 * Runs fully local if desired
@@ -31,7 +33,6 @@ Bring your own model. Run your own agent. Own your AI stack.
 ## Quick start
 ```bash
 pip install -r requirements.txt
-ollama pull qwen2.5:7b-instruct
 uvicorn app:app --reload --port 8001
 ```
 
@@ -39,11 +40,28 @@ Then connect the React UI to `http://localhost:8001/v1/chat/completions`.
 Open docs at `http://localhost:8001/docs`.
 
 Defaults:
-- Ollama endpoint: `http://localhost:11434` (override with `OLLAMA_BASE_URL`)
-- Model: `qwen2.5:7b-instruct` (override with `OLLAMA_MODEL`)
+- Provider auto-detection order: OpenAI -> Anthropic -> Ollama
+- Optional explicit model override: `MANTIS_MODEL`
 - Vector memory path: `.mantis/chroma` (override with `MANTIS_CHROMA_DIR`)
 
-Tool calls: the agent emits `TOOL: tool_name | input`. Supported tools in the MVP are `python` (executes Python code locally — WARNING: full system access) and `http` (fetches a URL and returns the first ~2000 chars of cleaned text).
+Tool calls: the agent emits `TOOL: tool_name | input`.
+
+Runtime toolset includes:
+- Workspace awareness: `workspace.tree`, `workspace.read_file`, `workspace.search`, `workspace.snapshot`
+- Code editing: `create_file`, `write_file`, `patch_file`, `delete_file`
+- Validation: `run_tests` (auto-detects `pytest`, `npm test`, `make test`)
+- Git tools: `git.status`, `git.create_branch`, `git.diff`, `git.checkout`, `git.log`, `git.commit`
+- Utility: `python`, `http`
+
+Safety controls:
+- `MANTIS_DEV_MODE=true` enables planner-driven project loops.
+- `MANTIS_ALLOW_FILE_WRITE=false` by default disables file mutation tools.
+- `MANTIS_SANDBOX=true` restricts file writes to `./workspace/`.
+- All successful file mutations are logged to `.mantis/changes/`.
+- Resumable plans are persisted in `.mantis/plans/`.
+- Task queue is persisted in `.mantis/queue.json`.
+- Execution metrics are appended to `.mantis/metrics.jsonl`.
+- Worker includes autonomous repo task discovery and enqueues goals without user prompts.
 
 Try this to validate loop + tools:
 ```bash
@@ -60,6 +78,28 @@ cp .env.example .env
 bash scripts/install.sh
 python mantis.py chat
 ```
+
+## Cloud Mode (No Ollama)
+```bash
+pip install -r requirements.txt
+export OPENAI_API_KEY=your_key_here
+python mantis.py api
+```
+
+## Local Mode (Ollama)
+```bash
+ollama serve
+ollama pull qwen2.5:7b-instruct
+python mantis.py worker
+```
+
+## Hybrid Mode
+Mantis routes by model prefix:
+- `gpt*` -> OpenAI
+- `claude*` -> Anthropic
+- anything else -> Ollama
+
+You can run all providers together and select per-request with the `model` field.
 
 ---
 
