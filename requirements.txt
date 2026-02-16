@@ -2,6 +2,5 @@ fastapi
 uvicorn[standard]
 httpx
 chromadb
-sentence-transformers
 beautifulsoup4
 python-dotenv

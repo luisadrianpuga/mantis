@@ -1,6 +1,9 @@
 import argparse
 import asyncio
 import subprocess
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 def main() -> None:

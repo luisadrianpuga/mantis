@@ -101,6 +101,19 @@ Mantis routes by model prefix:
 
 You can run all providers together and select per-request with the `model` field.
 
+## Edge Mode (Raspberry Pi / Low Power Devices)
+
+Mantis supports running on ARM devices.
+
+In Edge Mode:
+- Memory uses keyword recall instead of embeddings
+- No PyTorch / Transformers required
+- LLM runs remotely via OpenAI-compatible API
+
+Recommended architecture:
+Raspberry Pi -> runs Mantis
+Gaming PC -> runs llama.cpp server
+
 ---
 
 ## Why Mantis exists
