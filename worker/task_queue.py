@@ -18,6 +18,7 @@ class TaskQueue:
             "id": uuid.uuid4().hex,
             "goal": goal,
             "status": "pending",
+            "retries": 0,
             "created_at": _now_iso(),
             "updated_at": _now_iso(),
         }
@@ -48,11 +49,25 @@ class TaskQueue:
     def list_items(self) -> List[Dict[str, Any]]:
         return self._read()
 
+    def increment_retries(self, task_id: str) -> None:
+        items = self._read()
+        for item in items:
+            if item.get("id") == task_id:
+                item["retries"] = int(item.get("retries", 0)) + 1
+                item["updated_at"] = _now_iso()
+        self._write(items)
+
     def has_goal(self, goal: str) -> bool:
         normalized = goal.strip().lower()
         if not normalized:
             return False
-        return any(item.get("goal", "").strip().lower() == normalized for item in self._read())
+
+        for item in self._read():
+            existing = item.get("goal", "").strip().lower()
+            if normalized in existing or existing in normalized:
+                return True
+
+        return False
 
     def _read(self) -> List[Dict[str, Any]]:
         try:

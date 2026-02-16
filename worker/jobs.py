@@ -9,6 +9,14 @@ def get_default_jobs() -> list[Job]:
             interval_seconds=60 * 10,
         ),
         Job(
+            name="idle_improvement",
+            description=(
+                "No tasks are pending. Review the repository snapshot and "
+                "propose one small improvement task to enqueue."
+            ),
+            interval_seconds=60 * 20,
+        ),
+        Job(
             name="self_reflection",
             description=(
                 "Reflect on recent activity and produce a short journal entry describing:\n"

@@ -2,6 +2,8 @@ import asyncio
 import logging
 import os
 import sys
+from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 
 from agent.loop import AgentLoop
 from agent.memory import MemoryManager
@@ -31,11 +33,11 @@ def _configure_logging() -> None:
 
     file_path = os.path.abspath(LOG_FILE)
     has_file_handler = any(
-        isinstance(handler, logging.FileHandler) and os.path.abspath(handler.baseFilename) == file_path
+        isinstance(handler, RotatingFileHandler) and os.path.abspath(handler.baseFilename) == file_path
         for handler in logger.handlers
     )
     if not has_file_handler:
-        file_handler = logging.FileHandler(LOG_FILE)
+        file_handler = RotatingFileHandler(LOG_FILE, maxBytes=5_000_000, backupCount=3)
         file_handler.setFormatter(log_format)
         logger.addHandler(file_handler)
 
@@ -102,6 +104,8 @@ def _print_worker_health_banner(default_model: str | None) -> None:
     print("🪲 Mantis Worker running (autonomous mode)")
     print(f"Safety mode: {'ON' if safe_mode else 'OFF'}")
     print(f"Dangerous tools: {'ENABLED' if dangerous_enabled else 'DISABLED'}")
+    if dangerous_enabled:
+        print("⚠️  WARNING: Agent can modify files.")
     print(f"Default model: {default_model or 'None detected'}")
 
     print("\nProviders detected:")
@@ -171,18 +175,36 @@ async def main() -> None:
 
         while True:
             try:
-                await _ensure_tasks_exist(agent_loop, identity, task_queue, provider_router.default_model)
-                next_task = task_queue.next_pending()
-                if next_task:
+                if os.getenv("MANTIS_STOP") == "1":
+                    logger.info("Stop signal received. Worker exiting.")
+                    break
+
+                os.makedirs(".mantis", exist_ok=True)
+                with open(".mantis/heartbeat", "w", encoding="utf-8") as handle:
+                    handle.write(datetime.now(timezone.utc).isoformat())
+
+                while True:
+                    next_task = task_queue.next_pending()
+                    if not next_task:
+                        break
+
                     goal = next_task.get("goal", "")
                     task_id = next_task.get("id", "")
                     logger.info("Running queued task %s: %s", task_id, goal)
                     result = await agent_loop.run(goal, model=provider_router.default_model)
                     if "Reached iteration limit" in result or "failing" in result.lower():
-                        task_queue.set_status(task_id, "failed")
+                        task_queue.increment_retries(task_id)
+                        current_retries = int(next_task.get("retries", 0)) + 1
+                        if current_retries >= 3:
+                            task_queue.set_status(task_id, "failed")
+                            logger.info("Task permanently failed after 3 retries.")
+                        else:
+                            task_queue.set_status(task_id, "pending")
+                            logger.info("Task scheduled for retry.")
                     else:
                         task_queue.set_status(task_id, "done")
-                    continue
+
+                await _ensure_tasks_exist(agent_loop, identity, task_queue, provider_router.default_model)
 
                 jobs = scheduler.due_jobs()
                 for job in jobs:

@@ -33,6 +33,11 @@ async def run_job(agent: AgentLoop, job: Job, identity: IdentityManager | None =
         _log_job_result(job.name, result)
         agent.memory.store_memory(result, {"source": "worker", "job": job.name, "ran_at": datetime.utcnow().isoformat()})
         return result
+    if job.name == "idle_improvement":
+        result = await run_idle_improvement(agent, identity)
+        _log_job_result(job.name, result)
+        agent.memory.store_memory(result, {"source": "worker", "job": job.name, "ran_at": datetime.utcnow().isoformat()})
+        return result
 
     messages = [
         {"role": "system", "content": "You are running an autonomous scheduled task."},
@@ -75,6 +80,26 @@ async def run_repo_discovery(agent: AgentLoop, identity: IdentityManager | None 
         identity.append_journal("Discovered new development tasks.")
 
     return f"Task discovery completed. Enqueued {enqueued} tasks."
+
+
+async def run_idle_improvement(agent: AgentLoop, identity: IdentityManager | None = None) -> str:
+    snapshot = await agent.tools.run("workspace.snapshot", "")
+    analyzer = RepoAnalyzer(agent.llm)
+    goals = await analyzer.discover_goals(snapshot)
+
+    queue = TaskQueue()
+    for goal in goals[:1]:
+        goal = goal.strip()
+        if not goal:
+            continue
+        if queue.has_goal(goal):
+            continue
+        queue.enqueue(goal)
+        if identity:
+            identity.append_journal("Idle improvement task generated.")
+        return "Idle improvement task enqueued."
+
+    return "No new idle improvements found."
 
 
 def _log_job_result(job_name: str, result: str) -> None:
