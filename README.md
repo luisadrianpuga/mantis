@@ -114,6 +114,33 @@ Recommended architecture:
 Raspberry Pi -> runs Mantis
 Gaming PC -> runs llama.cpp server
 
+### What we changed for Raspberry Pi
+
+The Pi crash (`Illegal instruction`) came from x86-oriented ML dependencies pulled by embedding libraries.
+To make Mantis ARM-safe, we changed the runtime to avoid those dependencies:
+
+- Replaced embedding-based memory with lightweight keyword recall in `agent/memory.py`
+- Removed `sentence-transformers` from `requirements.txt` and installer flow
+- Kept memory persistence through Chroma, using a placeholder embedding at write time
+- Loaded `.env` at startup in `mantis.py` so CLI chat mode can read `MANTIS_BASE_URL` before provider detection
+
+### How it works on Pi now
+
+1. Raspberry Pi runs the Mantis agent loop and tools.
+2. Mantis reads `MANTIS_BASE_URL` from `.env` and detects your OpenAI-compatible endpoint.
+3. All LLM inference is sent to your remote server (for example, llama.cpp on a gaming PC).
+4. Memory retrieval on Pi uses keyword matching instead of local embedding models.
+
+Result: no PyTorch download path, no x86 AVX dependency, and stable startup on ARM devices.
+
+### Quick Pi startup
+
+```bash
+pip install -r requirements.txt
+export MANTIS_BASE_URL=http://<gaming-pc-ip>:<port>/v1
+python3 mantis.py chat
+```
+
 ---
 
 ## Why Mantis exists
