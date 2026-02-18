@@ -1,4 +1,6 @@
-.mantis/
+
+
 .env
+.mantis/
 __pycache__/
 *.pyc
