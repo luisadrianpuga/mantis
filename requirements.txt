@@ -1,4 +1,4 @@
 httpx
 chromadb
-sentence-transformers
+python-dotenv
 watchdog
