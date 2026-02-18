@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""
+Three-rule emergent agent
+ATTEND → ASSOCIATE → ACT → (side effects loop back)
+
+Wired to: http://192.168.1.232:8001
+Model:     Qwen2.5-14B-Instruct-Q4_K_M.gguf
+"""
+
+import httpx
+import chromadb
+import subprocess
+import uuid
+import re
+import os
+from datetime import datetime
+from pathlib import Path
+from queue import Queue
+from sentence_transformers import SentenceTransformer
+from dotenv import load_dotenv
+
+# ── Config ────────────────────────────────────────────────────────────────────
+load_dotenv()
+
+
+
+#!/usr/bin/env python3
+"""
+Three-rule emergent agent
+ATTEND → ASSOCIATE → ACT → (side effects loop back)
+
+Wired to: http://192.168.1.232:8001
+Model:     Qwen2.5-14B-Instruct-Q4_K_M.gguf
+
+Memory:    ChromaDB (vector) + SQLite FTS5 (keyword) + MEMORY.md (markdown)
+Safety:    Lane Queue — serial FIFO per source, no race conditions
+"""
+
+import httpx
+import chromadb
+import subprocess
+import sqlite3
+import uuid
+import re
+import threading
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+from queue import Queue, Empty
+from sentence_transformers import SentenceTransformer
+
+# ── Config ────────────────────────────────────────────────────────────────────
+LLM_BASE = os.getenv("LLM_BASE", "http://localhost:8001/v1")
+MODEL = os.getenv("MODEL", "Qwen2.5-14B-Instruct-Q4_K_M.gguf")
+MEMORY_DIR = os.getenv("MEMORY_DIR", ".agent/memory")
+SOUL_PATH = Path(os.getenv("SOUL_PATH", "SOUL.md"))
+TOP_K = int(os.getenv("TOP_K", "4"))
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "512"))
+
+DB_PATH     = MEMORY_DIR / "fts.db"
+MEMORY_MD   = Path(".agent/MEMORY.md")
+
+# ── Boot ──────────────────────────────────────────────────────────────────────
+MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+
+encoder    = SentenceTransformer("all-MiniLM-L6-v2")
+db         = chromadb.PersistentClient(str(MEMORY_DIR))
+collection = db.get_or_create_collection("events")
+
+# ── SQLite FTS5 setup ─────────────────────────────────────────────────────────
+def _get_fts_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    conn.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS memories
+        USING fts5(text, source, ts)
+    """)
+    conn.commit()
+    return conn
+
+fts_conn  = _get_fts_conn()
+fts_lock  = threading.Lock()
+
+def fts_store(text: str, source: str, ts: str) -> None:
+    with fts_lock:
+        fts_conn.execute(
+            "INSERT INTO memories(text, source, ts) VALUES (?, ?, ?)",
+            (text, source, ts)
+        )
+        fts_conn.commit()
+
+def fts_search(query: str, k: int = TOP_K) -> list[str]:
+    with fts_lock:
+        rows = fts_conn.execute(
+            "SELECT text FROM memories WHERE memories MATCH ? ORDER BY rank LIMIT ?",
+            (query, k)
+        ).fetchall()
+    return [r[0] for r in rows]
+
+# ── MEMORY.md ─────────────────────────────────────────────────────────────────
+def md_append(text: str, source: str) -> None:
+    ts = datetime.utcnow().isoformat()
+    line = f"\n- [{ts}] ({source}) {text[:300]}"
+    with open(MEMORY_MD, "a", encoding="utf-8") as f:
+        f.write(line)
+
+def md_tail(n: int = 6) -> list[str]:
+    if not MEMORY_MD.exists():
+        return []
+    lines = MEMORY_MD.read_text(encoding="utf-8").strip().splitlines()
+    return [l.strip("- ").strip() for l in lines[-n:] if l.strip()]
+
+# ── Lane Queue — serial FIFO per source ───────────────────────────────────────
+class LaneQueue:
+    """
+    One queue per lane (source). Each lane processes serially.
+    Prevents race conditions when multiple event sources fire simultaneously.
+    """
+    def __init__(self):
+        self._lanes: dict[str, Queue] = defaultdict(Queue)
+        self._locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
+
+    def put(self, event: dict):
+        lane = event.get("source", "user")
+        self._lanes[lane].put(event)
+
+    def drain(self) -> list[dict]:
+        """Return all pending events across all lanes, respecting per-lane order."""
+        events = []
+        for lane, q in self._lanes.items():
+            while True:
+                try:
+                    events.append(q.get_nowait())
+                except Empty:
+                    break
+        return events
+
+    def lock(self, source: str) -> threading.Lock:
+        return self._locks[source]
+
+lane_queue = LaneQueue()
+
+# ── Soul ──────────────────────────────────────────────────────────────────────
+def load_soul() -> str:
+    if SOUL_PATH.exists():
+        return SOUL_PATH.read_text(encoding="utf-8").strip()
+    return "You are a sharp, minimal, autonomous agent with memory and terminal access."
+
+# ── Tools ─────────────────────────────────────────────────────────────────────
+def run_command(cmd: str) -> str:
+    try:
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, timeout=30
+        )
+        out = result.stdout.strip() or result.stderr.strip() or "(no output)"
+        return f"$ {cmd}\n{out}"
+    except subprocess.TimeoutExpired:
+        return f"$ {cmd}\n(timed out after 30s)"
+    except Exception as e:
+        return f"$ {cmd}\n(error: {e})"
+
+def read_file(path: str) -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except Exception as e:
+        return f"(read error: {e})"
+
+def write_file(path: str, content: str) -> str:
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+        return f"wrote {path}"
+    except Exception as e:
+        return f"(write error: {e})"
+
+def parse_command(reply: str) -> str | None:
+    m = re.search(r"COMMAND:\s*(.+)", reply)
+    return m.group(1).strip() if m else None
+
+def parse_read(reply: str) -> str | None:
+    m = re.search(r"READ:\s*(.+)", reply)
+    return m.group(1).strip() if m else None
+
+def parse_write(reply: str) -> tuple[str, str] | None:
+    m = re.search(r"WRITE:\s*(.+?)\n(.*)", reply, re.DOTALL)
+    return (m.group(1).strip(), m.group(2).strip()) if m else None
+
+# ── Rule 1: ATTEND ────────────────────────────────────────────────────────────
+def attend(text: str, source: str = "user"):
+    lane_queue.put({
+        "text": text,
+        "source": source,
+        "ts": datetime.utcnow().isoformat(),
+    })
+
+# ── Rule 2: ASSOCIATE ─────────────────────────────────────────────────────────
+def associate(event: dict) -> dict | None:
+    text   = event["text"]
+    source = event.get("source", "user")
+    ts     = event["ts"]
+
+    # skip echoes — store but don't act
+    if source == "agent_echo":
+        fts_store(text, source, ts)
+        md_append(text, source)
+        return None
+
+    vec = encoder.encode(text).tolist()
+
+    # vector recall
+    vec_results = collection.query(query_embeddings=[vec], n_results=TOP_K)
+    vec_recall  = vec_results["documents"][0] if vec_results["documents"] else []
+
+    # keyword recall — safe query (strip special chars for FTS5)
+    safe_query = re.sub(r'[^\w\s]', ' ', text).strip()
+    fts_recall = fts_search(safe_query) if safe_query else []
+
+    # recent markdown tail
+    md_recall = md_tail(4)
+
+    # merge and dedupe
+    seen    = set()
+    recalled = []
+    for item in vec_recall + fts_recall + md_recall:
+        if item and item not in seen:
+            seen.add(item)
+            recalled.append(item)
+    recalled = recalled[:TOP_K * 2]
+
+    # store in all three layers
+    collection.add(
+        ids=[str(uuid.uuid4())],
+        documents=[text],
+        embeddings=[vec],
+        metadatas=[{"ts": ts, "source": source}],
+    )
+    fts_store(text, source, ts)
+    md_append(text, source)
+
+    return {"input": text, "memory": recalled, "source": source}
+
+# ── Rule 3: ACT ───────────────────────────────────────────────────────────────
+def act(context: dict) -> str:
+    soul         = load_soul()
+    memory_block = "\n".join(f"- {m}" for m in context["memory"]) or "(none yet)"
+
+    system = (
+        f"{soul}\n\n"
+        "---\n"
+        f"Relevant memory:\n{memory_block}\n\n"
+        "---\n"
+        "Tools — emit exactly one per reply if needed:\n"
+        "  COMMAND: <shell command>\n"
+        "  READ: <filepath>\n"
+        "  WRITE: <filepath>\n<full file content>\n\n"
+        "Tool result will be fed back. Otherwise reply directly."
+    )
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user",   "content": context["input"]},
+    ]
+
+    r = httpx.post(
+        f"{LLM_BASE}/chat/completions",
+        json={"model": MODEL, "messages": messages, "max_tokens": MAX_TOKENS},
+        timeout=60,
+    )
+    r.raise_for_status()
+    reply = r.json()["choices"][0]["message"]["content"].strip()
+
+    # tool dispatch
+    cmd = parse_command(reply)
+    if cmd:
+        print(f"\n  [running: {cmd}]")
+        result = run_command(cmd)
+        print(f"  {result}\n")
+        attend(f"command result: {result}", source="tool")
+        reply = reply[:reply.index("COMMAND:")].strip() or "(ran command)"
+
+    read_path = parse_read(reply)
+    if read_path:
+        print(f"\n  [reading: {read_path}]")
+        contents = read_file(read_path)
+        print(f"  ({len(contents)} chars)\n")
+        attend(f"file contents of {read_path}:\n{contents}", source="tool")
+        reply = reply[:reply.index("READ:")].strip() or "(read file)"
+
+    write_result = parse_write(reply)
+    if write_result:
+        wpath, wcontent = write_result
+        print(f"\n  [writing: {wpath}]")
+        result = write_file(wpath, wcontent)
+        print(f"  {result}\n")
+        attend(f"file write result: {result}", source="tool")
+        reply = reply[:reply.index("WRITE:")].strip() or "(wrote file)"
+
+    # echo back into memory only
+    attend(f"agent: {reply}", source="agent_echo")
+
+    return reply
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
+def main():
+    print("agent ready. ctrl+c to exit.\n")
+    while True:
+        try:
+            user_input = input("you: ").strip()
+            if not user_input:
+                continue
+            if user_input.lower() in {"exit", "quit"}:
+                break
+
+            # Rule 1
+            attend(user_input, source="user")
+
+            # drain all lanes serially
+            events = lane_queue.drain()
+            for event in events:
+                source = event.get("source", "user")
+                with lane_queue.lock(source):
+                    context = associate(event)
+                    if context:
+                        reply = act(context)
+                        if source not in {"agent_echo", "tool"}:
+                            print(f"\nagent: {reply}\n")
+
+                # tool events may have added more — drain again
+                spillover = lane_queue.drain()
+                for sp_event in spillover:
+                    sp_source = sp_event.get("source", "user")
+                    with lane_queue.lock(sp_source):
+                        sp_context = associate(sp_event)
+                        if sp_context:
+                            sp_reply = act(sp_context)
+                            if sp_source not in {"agent_echo", "tool"}:
+                                print(f"\nagent: {sp_reply}\n")
+
+        except KeyboardInterrupt:
+            print("\nbye.")
+            break
+
+if __name__ == "__main__":
+    main()
