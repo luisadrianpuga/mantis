@@ -24,7 +24,7 @@ import chromadb
 import httpx
 from dotenv import load_dotenv
 
-from docs.assets import start_up_logo
+from docs.assets.start_up_logo import start_up_logo as START_UP_LOGO
 
 # -- Config -------------------------------------------------------------------
 load_dotenv()
@@ -43,8 +43,7 @@ DB_PATH = MEMORY_DIR / "fts.db"
 MEMORY_MD = Path(".agent/MEMORY.md")
 EMBED_DIM = 384
 
-
-print(start_up_logo)
+print(START_UP_LOGO)
 # -- Boot ---------------------------------------------------------------------
 MEMORY_DIR.mkdir(parents=True, exist_ok=True)
 db = chromadb.PersistentClient(str(MEMORY_DIR))
@@ -166,6 +165,18 @@ _watcher_lock = threading.Lock()
 _last_seen_fs: dict[str, float] = {}
 _fs_lock = threading.Lock()
 _FS_DEBOUNCE_SEC = 10.0
+_console_lock = threading.Lock()
+_input_waiting = threading.Event()
+
+
+def ui_print(message: str = "", redraw_prompt: bool = True) -> None:
+    with _console_lock:
+        if message:
+            print(message, flush=True)
+        else:
+            print("", flush=True)
+        if redraw_prompt and _input_waiting.is_set():
+            print("you: ", end="", flush=True)
 
 
 # -- Soul ---------------------------------------------------------------------
@@ -276,7 +287,7 @@ def start_watcher():
         from watchdog.events import FileSystemEventHandler
         from watchdog.observers import Observer
     except Exception as e:
-        print(f"[watcher] disabled (watchdog unavailable): {e}")
+        ui_print(f"[watcher] disabled (watchdog unavailable): {e}")
         return
 
     class MantisHandler(FileSystemEventHandler):
@@ -304,9 +315,9 @@ def start_watcher():
         observer.schedule(MantisHandler(), WATCH_PATH, recursive=True)
         observer.start()
     except Exception as e:
-        print(f"[watcher] failed to start on {WATCH_PATH}: {e}")
+        ui_print(f"[watcher] failed to start on {WATCH_PATH}: {e}")
         return
-    print(f"[watcher] watching: {WATCH_PATH}")
+    ui_print(f"[watcher] watching: {WATCH_PATH}")
 
     try:
         while not _event_loop_stop.is_set():
@@ -326,9 +337,9 @@ def process_events_once() -> None:
                 continue
             reply = act(context)
             if source == "autonomous":
-                print(f"\n[mantis]: {reply}\n")
+                ui_print(f"\n[mantis]: {reply}\n")
             elif source not in {"agent_echo", "tool"}:
-                print(f"\nagent: {reply}\n")
+                ui_print(f"\nagent: {reply}\n")
 
 
 def event_loop():
@@ -420,26 +431,26 @@ def act(context: dict) -> str:
 
     cmd = parse_command(reply)
     if cmd:
-        print(f"\n  [running: {cmd}]")
+        ui_print(f"\n  [running: {cmd}]")
         result = run_command(cmd)
-        print(f"  {result}\n")
+        ui_print(f"  {result}\n")
         attend(f"command result: {result}", source="tool")
         reply = reply[: reply.index("COMMAND:")].strip() or "(ran command)"
 
     read_path = parse_read(reply)
     if read_path:
-        print(f"\n  [reading: {read_path}]")
+        ui_print(f"\n  [reading: {read_path}]")
         contents = read_file(read_path)
-        print(f"  ({len(contents)} chars)\n")
+        ui_print(f"  ({len(contents)} chars)\n")
         attend(f"file contents of {read_path}:\n{contents}", source="tool")
         reply = reply[: reply.index("READ:")].strip() or "(read file)"
 
     write_result = parse_write(reply)
     if write_result:
         wpath, wcontent = write_result
-        print(f"\n  [writing: {wpath}]")
+        ui_print(f"\n  [writing: {wpath}]")
         result = write_file(wpath, wcontent)
-        print(f"  {result}\n")
+        ui_print(f"  {result}\n")
         attend(f"file write result: {result}", source="tool")
         reply = reply[: reply.index("WRITE:")].strip() or "(wrote file)"
 
@@ -453,10 +464,12 @@ def main():
     threading.Thread(target=autonomous_loop, daemon=True).start()
     threading.Thread(target=start_watcher, daemon=True).start()
 
-    print("agent ready. ctrl+c to exit.\n")
+    ui_print("agent ready. ctrl+c to exit.\n", redraw_prompt=False)
     while True:
         try:
+            _input_waiting.set()
             user_input = input("you: ").strip()
+            _input_waiting.clear()
             if not user_input:
                 continue
             if user_input.lower() in {"exit", "quit"}:
@@ -465,8 +478,9 @@ def main():
 
             attend(user_input, source="user")
         except KeyboardInterrupt:
+            _input_waiting.clear()
             _event_loop_stop.set()
-            print("\nbye.")
+            ui_print("\nbye.", redraw_prompt=False)
             break
 
 
