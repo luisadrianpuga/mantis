@@ -1,149 +1,127 @@
-# Mantis — Personal AI Assistant
+# Mantis
 
 <p align="center">
-    <picture>
-        <source media="(prefers-color-scheme: light)" srcset="docs/assets/mantis-logo.png">
-        <img src="docs/assets/mantis-logo.png" alt="MantisLogo" width="500">
-    </picture>
+  <picture>
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/mantis-logo.png">
+    <img src="docs/assets/mantis-logo.png" alt="Mantis logo" width="500">
+  </picture>
 </p>
 
-<p align="center">
-  <strong>AUTOMATE! AUTOMATE!</strong>
-</p>
+Mantis is a local-first Python agent runtime that implements a three-stage loop:
+`ATTEND -> ASSOCIATE -> ACT`.
 
-**Mantis** is a minimal, extensible personal AI runtime for autonomous task execution with local LLMs, vector memory, and tool orchestration.
+The system combines:
+- OpenAI-compatible chat completion calls for reasoning
+- hybrid memory retrieval (vector + keyword + markdown log)
+- lightweight tool execution (`COMMAND`, `READ`, `WRITE`)
+- optional autonomous periodic reflection
+- optional filesystem event ingestion
 
----
+## Scope
 
-## Architecture
+This repository currently provides a single executable runtime (`mantis.py`) intended for local experimentation and research prototyping. It is not packaged as a production service.
 
-```mermaid
-flowchart LR
+## Runtime Model
 
-User[User / Apps] --> API[OpenAI-Compatible API]
+For each event, Mantis performs:
+1. `ATTEND`: queue an event tagged with source and timestamp.
+2. `ASSOCIATE`: retrieve related memories from three stores and persist the new event.
+3. `ACT`: call the configured LLM and optionally execute one tool action.
 
-API --> Agent[Agent Runtime Loop]
+### Event Sources
 
-Agent --> Prompt[Prompt Builder]
-Agent --> Memory[Vector Memory]
-Agent --> Tools[Tool Router]
+Supported event sources in the current implementation:
+- `user` (interactive CLI input)
+- `filesystem` (watchdog events)
+- `autonomous` (timer-triggered prompts)
+- `tool` (tool output fed back to loop)
+- `agent_echo` (agent response persisted to memory)
 
-Prompt --> LLM[Local LLM Server]
+### Memory Subsystems
 
-Memory --> VectorDB[(Vector Database)]
+Mantis persists and recalls memory through:
+- ChromaDB persistent collection (`events`) for vector retrieval
+- SQLite FTS5 table (`memories`) for keyword retrieval
+- markdown append-only log at `.agent/MEMORY.md`
 
-Tools --> Python[Python Executor]
-Tools --> Browser[Browser Automation]
-Tools --> HTTP[HTTP / APIs]
+The retrieved context is deduplicated and provided to the LLM as "Relevant memory".
 
-LLM --> Agent
-Python --> Agent
-Browser --> Agent
-HTTP --> Agent
+## Tool Interface
+
+The model can emit at most one primary tool directive per response using strict markers:
+- `COMMAND: <shell command>`
+- `READ: <filepath>`
+- `WRITE: <filepath>` followed by full file content
+
+Tool results are re-injected as events (`source="tool"`) and influence subsequent turns.
+
+## Requirements
+
+- Python 3.10+
+- A reachable OpenAI-compatible `/v1/chat/completions` endpoint
+- Dependencies in `requirements.txt`
+
+Install:
+
+```bash
+pip install -r requirements.txt
 ```
 
----
+Run:
 
-## How it works
+```bash
+python mantis.py
+```
 
-Every request triggers a short autonomous agent cycle.
+## Configuration
 
-1. **Request enters the API**
-   Messages from the UI, CLI, or integrations are received through an OpenAI-compatible endpoint.
+Configuration is loaded from environment variables (`.env` supported via `python-dotenv`).
 
-2. **Context is assembled**
-   The runtime gathers recent conversation plus relevant long-term memories retrieved from the vector database.
+Default values in code:
 
-3. **The agent decides what to do**
-   The LLM receives the full context and chooses the next action:
+| Variable | Default | Description |
+|---|---|---|
+| `LLM_BASE` | `http://localhost:8001/v1` | Base URL for chat completion API |
+| `MODEL` | `Qwen2.5-14B-Instruct-Q4_K_M.gguf` | Model identifier sent in request payload |
+| `MEMORY_DIR` | `.agent/memory` | ChromaDB and SQLite storage directory |
+| `SOUL_PATH` | `SOUL.md` | System prompt file path |
+| `TOP_K` | `4` | Retrieval depth per store |
+| `MAX_TOKENS` | `512` | `max_tokens` for completion call |
+| `EMBEDDING_BACKEND` | `hash` | `hash` or `sentence-transformers` |
+| `AUTONOMOUS_INTERVAL_SEC` | `300` | Period for autonomous prompts |
+| `WATCH_PATH` | `.` | Root path for filesystem watcher |
 
-   * reply to the user
-   * call a tool
-   * store new memory
+### Embedding Backend Notes
 
-4. **Tools execute real actions**
-   If a tool is requested, Mantis runs code, fetches data, or automates tasks and feeds the result back into the loop.
+- `hash` backend is dependency-free and deterministic.
+- `sentence-transformers` backend is supported in code but requires installing `sentence-transformers` separately (not included in `requirements.txt`).
 
-5. **Response is returned**
-   The loop ends when the agent produces a final answer.
+## Execution Characteristics and Limits
 
-This cycle transforms a chat model into a persistent, tool-using personal AI runtime.
+- Tool command execution uses `subprocess.run(..., shell=True, timeout=30)`.
+- File writes can target arbitrary paths accessible to the process.
+- No authentication, sandboxing, or policy engine is implemented inside `mantis.py`.
+- Error handling for the LLM call is minimal (`raise_for_status()` then parse JSON).
 
+These properties make the current runtime suitable for controlled local environments, not untrusted multi-tenant deployment.
 
-Add the links directly in the inspiration section.
+## Repository Layout
 
----
+- `mantis.py`: main runtime
+- `requirements.txt`: Python dependencies
+- `docs/assets/`: static assets (logo, startup banner module)
+- `soul.md`: example prompt text file in this repo (note: default lookup path in code is `SOUL.md` unless overridden)
+
+## Scientific Writing and Evaluation Guidance
+
+If this project is used for scientific workflows, treat the runtime as an experimental system. Recommended practice:
+- state the exact commit hash and environment variables used in experiments
+- fix model version and endpoint implementation for reproducibility
+- log all tool invocations and side effects as part of experimental records
+- report known threats to validity (prompt drift, retrieval noise, nondeterministic model outputs)
+- separate exploratory qualitative findings from quantitative claims
 
 ## Inspiration
 
-Mantis is inspired by two excellent open-source projects that helped shape the modern personal-AI runtime pattern:
-
-* **OpenClaw** — local LLM agent runtime focused on autonomy and tool usage
-  [https://github.com/OpenClaw/OpenClaw](https://github.com/OpenClaw/OpenClaw)
-
-* **PicoClaw** — lightweight multi-provider agent with skills, gateways, and scheduling
-  [https://github.com/sipeed/picoclaw](https://github.com/sipeed/picoclaw)
-
-Both projects demonstrate the same core idea: people want their **own AI runtime**, not just an API.
-
----
-
-## How Mantis differs
-
-While these projects are powerful, they are also large, feature-rich systems.
-
-Mantis intentionally takes a different approach:
-
-**Mantis distills the core architecture down to its essentials.**
-
-Instead of starting with many integrations and features, Mantis focuses on the smallest set of components required to build a personal AI runtime.
-
----
-
-### What we kept
-
-From OpenClaw:
-
-* Autonomous agent loop
-* Local-first LLM workflow
-* Tool orchestration model
-
-From PicoClaw:
-
-* OpenAI-compatible API surface
-* Modular tool / skill mindset
-* Gateway-friendly architecture
-
-These ideas form the foundation of the ecosystem.
-
----
-
-### What we simplified
-
-Mantis removes everything non-essential and rebuilds the stack from first principles.
-
-The goal is clarity over complexity.
-
-Mantis is designed to be:
-
-* Easy to understand
-* Easy to run locally
-* Easy to extend
-* Easy to learn from
-
-It is a **reference implementation**, not a feature race.
-
----
-
-## Philosophy
-
-OpenClaw and PicoClaw show what a full agent platform can become.
-Mantis focuses on the smallest architecture that makes that future possible.
-
-Think of it as:
-
-* The minimal kernel
-* The clean blueprint
-* The learning-friendly runtime
-
-A foundation that anyone can read, run, and build upon.
+- OpenClaw: https://github.com/OpenClaw/OpenClaw
+- PicoClaw: https://github.com/sipeed/picoclaw
