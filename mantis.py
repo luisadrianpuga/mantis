@@ -13,6 +13,7 @@ import re
 import sqlite3
 import subprocess
 import threading
+import time
 import uuid
 from collections import defaultdict
 from datetime import datetime
@@ -35,6 +36,8 @@ SOUL_PATH = Path(os.getenv("SOUL_PATH", "SOUL.md"))
 TOP_K = int(os.getenv("TOP_K", "4"))
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "512"))
 EMBEDDING_BACKEND = os.getenv("EMBEDDING_BACKEND", "hash").lower()
+AUTONOMOUS_INTERVAL_SEC = int(os.getenv("AUTONOMOUS_INTERVAL_SEC", "300"))
+WATCH_PATH = os.getenv("WATCH_PATH", ".")
 
 DB_PATH = MEMORY_DIR / "fts.db"
 MEMORY_MD = Path(".agent/MEMORY.md")
@@ -157,6 +160,12 @@ class LaneQueue:
 
 
 lane_queue = LaneQueue()
+_event_loop_stop = threading.Event()
+_watcher_started = False
+_watcher_lock = threading.Lock()
+_last_seen_fs: dict[str, float] = {}
+_fs_lock = threading.Lock()
+_FS_DEBOUNCE_SEC = 10.0
 
 
 # -- Soul ---------------------------------------------------------------------
@@ -210,6 +219,122 @@ def parse_read(reply: str) -> str | None:
 def parse_write(reply: str) -> tuple[str, str] | None:
     m = re.search(r"WRITE:\s*(.+?)\n(.*)", reply, re.DOTALL)
     return (m.group(1).strip(), m.group(2).strip()) if m else None
+
+
+def autonomous_prompt_for_hour(hour_utc: int) -> str:
+    if 6 <= hour_utc < 10:
+        return (
+            "It's morning. Reflect on the day ahead using recent memory and identify "
+            "one concrete priority."
+        )
+    if 18 <= hour_utc < 22:
+        return (
+            "It's evening. Review what was done today and explicitly note unresolved "
+            "items to revisit."
+        )
+    return (
+        "You're in an idle reflection window. Synthesize recent memories into a short "
+        "summary and store one durable insight."
+    )
+
+
+def autonomous_loop():
+    while not _event_loop_stop.is_set():
+        _event_loop_stop.wait(AUTONOMOUS_INTERVAL_SEC)
+        if _event_loop_stop.is_set():
+            break
+        prompt = autonomous_prompt_for_hour(datetime.utcnow().hour)
+        attend(prompt, source="autonomous")
+
+
+def _should_ignore_fs_path(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    if normalized.endswith(".pyc"):
+        return True
+    noisy_parts = ["/.agent/", "/__pycache__/", "/.git/"]
+    return any(part in f"/{normalized}/" for part in noisy_parts)
+
+
+def _debounced_fs_path(path: str) -> bool:
+    now = time.time()
+    with _fs_lock:
+        last = _last_seen_fs.get(path, 0.0)
+        if now - last < _FS_DEBOUNCE_SEC:
+            return True
+        _last_seen_fs[path] = now
+    return False
+
+
+def start_watcher():
+    global _watcher_started
+    with _watcher_lock:
+        if _watcher_started:
+            return
+        _watcher_started = True
+
+    try:
+        from watchdog.events import FileSystemEventHandler
+        from watchdog.observers import Observer
+    except Exception as e:
+        print(f"[watcher] disabled (watchdog unavailable): {e}")
+        return
+
+    class MantisHandler(FileSystemEventHandler):
+        def on_created(self, event):
+            self._handle(event, "created")
+
+        def on_modified(self, event):
+            self._handle(event, "modified")
+
+        def on_deleted(self, event):
+            self._handle(event, "deleted")
+
+        def _handle(self, event, event_type: str):
+            if event.is_directory:
+                return
+            path = str(getattr(event, "src_path", ""))
+            if not path or _should_ignore_fs_path(path):
+                return
+            if _debounced_fs_path(path):
+                return
+            attend(f"file {event_type}: {path}", source="filesystem")
+
+    observer = Observer()
+    try:
+        observer.schedule(MantisHandler(), WATCH_PATH, recursive=True)
+        observer.start()
+    except Exception as e:
+        print(f"[watcher] failed to start on {WATCH_PATH}: {e}")
+        return
+    print(f"[watcher] watching: {WATCH_PATH}")
+
+    try:
+        while not _event_loop_stop.is_set():
+            time.sleep(1)
+    finally:
+        observer.stop()
+        observer.join(timeout=5)
+
+
+def process_events_once() -> None:
+    events = lane_queue.drain()
+    for event in events:
+        source = event.get("source", "user")
+        with lane_queue.lock(source):
+            context = associate(event)
+            if not context:
+                continue
+            reply = act(context)
+            if source == "autonomous":
+                print(f"\n[mantis]: {reply}\n")
+            elif source not in {"agent_echo", "tool"}:
+                print(f"\nagent: {reply}\n")
+
+
+def event_loop():
+    while not _event_loop_stop.is_set():
+        process_events_once()
+        time.sleep(0.2)
 
 
 # -- Rule 1: ATTEND -----------------------------------------------------------
@@ -324,6 +449,10 @@ def act(context: dict) -> str:
 
 # -- Main loop ----------------------------------------------------------------
 def main():
+    threading.Thread(target=event_loop, daemon=True).start()
+    threading.Thread(target=autonomous_loop, daemon=True).start()
+    threading.Thread(target=start_watcher, daemon=True).start()
+
     print("agent ready. ctrl+c to exit.\n")
     while True:
         try:
@@ -331,30 +460,12 @@ def main():
             if not user_input:
                 continue
             if user_input.lower() in {"exit", "quit"}:
+                _event_loop_stop.set()
                 break
 
             attend(user_input, source="user")
-
-            events = lane_queue.drain()
-            for event in events:
-                source = event.get("source", "user")
-                with lane_queue.lock(source):
-                    context = associate(event)
-                    if context:
-                        reply = act(context)
-                        if source not in {"agent_echo", "tool"}:
-                            print(f"\nagent: {reply}\n")
-
-                spillover = lane_queue.drain()
-                for sp_event in spillover:
-                    sp_source = sp_event.get("source", "user")
-                    with lane_queue.lock(sp_source):
-                        sp_context = associate(sp_event)
-                        if sp_context:
-                            sp_reply = act(sp_context)
-                            if sp_source not in {"agent_echo", "tool"}:
-                                print(f"\nagent: {sp_reply}\n")
         except KeyboardInterrupt:
+            _event_loop_stop.set()
             print("\nbye.")
             break
 
