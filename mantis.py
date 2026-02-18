@@ -262,7 +262,7 @@ def _should_ignore_fs_path(path: str) -> bool:
     normalized = path.replace("\\", "/")
     if normalized.endswith(".pyc"):
         return True
-    noisy_parts = ["/.agent/", "/__pycache__/", "/.git/"]
+    noisy_parts = ["/.agent/", "/__pycache__/", "/.git/", "/venv/"]
     return any(part in f"/{normalized}/" for part in noisy_parts)
 
 
