@@ -2,11 +2,9 @@
 """
 Three-rule emergent agent
 ATTEND -> ASSOCIATE -> ACT -> (side effects loop back)
-
 Memory: ChromaDB (vector) + SQLite FTS5 (keyword) + MEMORY.md (markdown)
 Safety: Lane Queue (serial FIFO per source)
 """
-
 import hashlib
 import os
 import re
@@ -19,16 +17,13 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from queue import Empty, Queue
-
 import chromadb
 import httpx
 from dotenv import load_dotenv
-
 from docs.assets.start_up_logo import start_up_logo as START_UP_LOGO
 
 # -- Config -------------------------------------------------------------------
 load_dotenv()
-
 LLM_BASE = os.getenv("LLM_BASE", "http://localhost:8001/v1")
 MODEL = os.getenv("MODEL", "Qwen2.5-14B-Instruct-Q4_K_M.gguf")
 MEMORY_DIR = Path(os.getenv("MEMORY_DIR", ".agent/memory"))
@@ -38,12 +33,14 @@ MAX_TOKENS = int(os.getenv("MAX_TOKENS", "512"))
 EMBEDDING_BACKEND = os.getenv("EMBEDDING_BACKEND", "hash").lower()
 AUTONOMOUS_INTERVAL_SEC = int(os.getenv("AUTONOMOUS_INTERVAL_SEC", "300"))
 WATCH_PATH = os.getenv("WATCH_PATH", ".")
+MAX_HISTORY = int(os.getenv("MAX_HISTORY", "10"))
 
 DB_PATH = MEMORY_DIR / "fts.db"
 MEMORY_MD = Path(".agent/MEMORY.md")
 EMBED_DIM = 384
 
 print(START_UP_LOGO)
+
 # -- Boot ---------------------------------------------------------------------
 MEMORY_DIR.mkdir(parents=True, exist_ok=True)
 db = chromadb.PersistentClient(str(MEMORY_DIR))
@@ -62,23 +59,53 @@ def _hash_embed(text: str, dim: int = EMBED_DIM) -> list[float]:
     return out
 
 
-def _get_sentence_transformer():
-    global _encoder
-    if _encoder is not None:
-        return _encoder
-    with _encoder_lock:
-        if _encoder is not None:
-            return _encoder
-        # Lazy import to avoid startup crashes on unsupported CPU instruction sets.
-        from sentence_transformers import SentenceTransformer
+def _llm_embed(text: str) -> list[float] | None:
+    try:
+        r = httpx.post(
+            f"{LLM_BASE}/embeddings",
+            json={"model": MODEL, "input": text},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            emb = data.get("data", [{}])[0].get("embedding")
+            if isinstance(emb, list) and len(emb) > 0:
+                return emb
+    except Exception:
+        pass
+    return None
 
-        _encoder = SentenceTransformer("all-MiniLM-L6-v2")
-        return _encoder
+
+_llm_embed_available: bool | None = None
+_llm_embed_lock = threading.Lock()
 
 
 def embed_text(text: str) -> list[float]:
+    global _llm_embed_available
+
     if EMBEDDING_BACKEND == "sentence-transformers":
-        return _get_sentence_transformer().encode(text).tolist()
+        if _encoder is None:
+            with _encoder_lock:
+                from sentence_transformers import SentenceTransformer
+                globals()["_encoder"] = SentenceTransformer("all-MiniLM-L6-v2")
+        return _encoder.encode(text).tolist()
+
+    if EMBEDDING_BACKEND == "llm" or EMBEDDING_BACKEND == "hash":
+        # Try LLM embeddings first, fall back to hash
+        with _llm_embed_lock:
+            if _llm_embed_available is None:
+                probe = _llm_embed("test")
+                _llm_embed_available = probe is not None
+                if _llm_embed_available:
+                    print("[embeddings] using llm endpoint")
+                else:
+                    print("[embeddings] llm endpoint unavailable, using hash fallback")
+
+        if _llm_embed_available:
+            result = _llm_embed(text)
+            if result is not None:
+                return result
+
     return _hash_embed(text)
 
 
@@ -130,6 +157,26 @@ def md_tail(n: int = 6) -> list[str]:
         return []
     lines = MEMORY_MD.read_text(encoding="utf-8").strip().splitlines()
     return [l.strip("- ").strip() for l in lines[-n:] if l.strip()]
+
+
+# -- Conversation history -----------------------------------------------------
+_chat_history: list[dict] = []
+_history_lock = threading.Lock()
+
+
+def history_append(role: str, content: str, source: str = "user") -> None:
+    # only track user <-> agent exchanges, not tool/filesystem noise
+    if source not in {"user", "autonomous"}:
+        return
+    with _history_lock:
+        _chat_history.append({"role": role, "content": content})
+        if len(_chat_history) > MAX_HISTORY * 2:
+            _chat_history[:] = _chat_history[-MAX_HISTORY * 2:]
+
+
+def history_snapshot() -> list[dict]:
+    with _history_lock:
+        return list(_chat_history[-MAX_HISTORY:])
 
 
 # -- Lane Queue ---------------------------------------------------------------
@@ -232,6 +279,7 @@ def parse_write(reply: str) -> tuple[str, str] | None:
     return (m.group(1).strip(), m.group(2).strip()) if m else None
 
 
+# -- Autonomous ---------------------------------------------------------------
 def autonomous_prompt_for_hour(hour_utc: int) -> str:
     if 6 <= hour_utc < 10:
         return (
@@ -258,6 +306,7 @@ def autonomous_loop():
         attend(prompt, source="autonomous")
 
 
+# -- Filesystem watcher -------------------------------------------------------
 def _should_ignore_fs_path(path: str) -> bool:
     normalized = path.replace("\\", "/")
     if normalized.endswith(".pyc"):
@@ -327,6 +376,7 @@ def start_watcher():
         observer.join(timeout=5)
 
 
+# -- Event processing ---------------------------------------------------------
 def process_events_once() -> None:
     events = lane_queue.drain()
     for event in events:
@@ -403,6 +453,7 @@ def associate(event: dict) -> dict | None:
 def act(context: dict) -> str:
     soul = load_soul()
     memory_block = "\n".join(f"- {m}" for m in context["memory"]) or "(none yet)"
+    source = context.get("source", "user")
 
     system = (
         f"{soul}\n\n"
@@ -416,10 +467,9 @@ def act(context: dict) -> str:
         "Tool result will be fed back. Otherwise reply directly."
     )
 
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": context["input"]},
-    ]
+    messages = [{"role": "system", "content": system}]
+    messages.extend(history_snapshot())
+    messages.append({"role": "user", "content": context["input"]})
 
     r = httpx.post(
         f"{LLM_BASE}/chat/completions",
@@ -454,6 +504,10 @@ def act(context: dict) -> str:
         attend(f"file write result: {result}", source="tool")
         reply = reply[: reply.index("WRITE:")].strip() or "(wrote file)"
 
+    # store exchange in history (user and autonomous only)
+    history_append("user", context["input"], source=source)
+    history_append("assistant", reply, source=source)
+
     attend(f"agent: {reply}", source="agent_echo")
     return reply
 
@@ -475,7 +529,6 @@ def main():
             if user_input.lower() in {"exit", "quit"}:
                 _event_loop_stop.set()
                 break
-
             attend(user_input, source="user")
         except KeyboardInterrupt:
             _input_waiting.clear()
