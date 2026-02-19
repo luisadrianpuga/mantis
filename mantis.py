@@ -9,7 +9,9 @@ import hashlib
 import os
 import re
 import select
+import shlex
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -47,6 +49,8 @@ print(START_UP_LOGO)
 
 # -- Boot ---------------------------------------------------------------------
 MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+if "DISPLAY" not in os.environ:
+    os.environ["DISPLAY"] = ":0"
 
 
 def _ensure_shell_journal_hooked() -> None:
@@ -80,6 +84,37 @@ def _ensure_shell_journal_hooked() -> None:
 
 
 _ensure_shell_journal_hooked()
+
+
+def _ensure_computer_use_deps() -> None:
+    """Auto-install scrot and xdotool if not present."""
+    import shutil
+
+    missing = [tool for tool in ["scrot", "xdotool"] if not shutil.which(tool)]
+    if not missing:
+        return
+
+    print(f"[setup] installing computer use deps: {', '.join(missing)}")
+    try:
+        result = subprocess.run(
+            f"sudo apt install -y {' '.join(missing)}",
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode == 0:
+            print("[setup] computer use deps installed")
+        else:
+            print(f"[setup] install failed: {result.stderr[:200]}")
+    except Exception as e:
+        print(
+            "[setup] could not install deps: "
+            f"{e} — run: sudo apt install -y scrot xdotool"
+        )
+
+
+_ensure_computer_use_deps()
 db = chromadb.PersistentClient(str(MEMORY_DIR))
 collection = db.get_or_create_collection("events")
 
@@ -300,6 +335,8 @@ INTERACTIVE_COMMANDS = [
     "watch",
     "tail -f",
     "journalctl",
+    "xdotool selectwindow",
+    "xdotool behave",
 ]
 
 SAFE_ALTERNATIVES = {
@@ -438,6 +475,72 @@ def parse_read(reply: str) -> str | None:
 def parse_write(reply: str) -> tuple[str, str] | None:
     m = re.search(r"WRITE:\s*(.+?)\n(.*)", reply, re.DOTALL)
     return (m.group(1).strip(), m.group(2).strip()) if m else None
+
+
+def parse_screenshot(reply: str) -> str | None:
+    m = re.search(r"SCREENSHOT:\s*(.+)", reply)
+    return m.group(1).strip() if m else None
+
+
+def parse_click(reply: str) -> tuple[int, int] | None:
+    m = re.search(r"CLICK:\s*(\d+)\s+(\d+)", reply)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def parse_type(reply: str) -> str | None:
+    m = re.search(r"TYPE:\s*(.+)", reply)
+    return m.group(1).strip() if m else None
+
+
+def take_screenshot(path: str) -> str:
+    try:
+        p = Path(path).expanduser()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(
+            f"scrot {shlex.quote(str(p))}",
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            return f"screenshot saved to {p}"
+        return f"screenshot failed: {result.stderr.strip()}"
+    except Exception as e:
+        return f"screenshot error: {e}"
+
+
+def mouse_click(x: int, y: int) -> str:
+    try:
+        result = subprocess.run(
+            f"xdotool mousemove {x} {y} click 1",
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            return f"clicked {x},{y}"
+        return f"click failed: {result.stderr.strip()}"
+    except Exception as e:
+        return f"click error: {e}"
+
+
+def keyboard_type(text: str) -> str:
+    try:
+        safe = text.replace("'", "'\\''")
+        result = subprocess.run(
+            f"xdotool type --clearmodifiers '{safe}'",
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            return f"typed: {text}"
+        return f"type failed: {result.stderr.strip()}"
+    except Exception as e:
+        return f"type error: {e}"
 
 
 # -- Autonomous ---------------------------------------------------------------
@@ -675,10 +778,13 @@ def act(context: dict) -> str:
         "---\n"
         f"Relevant memory:\n{memory_block}\n\n"
         "---\n"
-        "Tools - emit exactly one per reply if needed:\n"
+        "Tools - emit one or more per reply if needed:\n"
         "  COMMAND: <shell command>\n"
         "  READ: <filepath>\n"
         "  WRITE: <filepath>\n<full file content>\n\n"
+        "  SCREENSHOT: <filepath>\n"
+        "  CLICK: <x> <y>\n"
+        "  TYPE: <text>\n\n"
         "Tool result will be fed back. Otherwise reply directly."
     )
 
@@ -743,6 +849,31 @@ def act(context: dict) -> str:
         ui_print(f"  {result}\n")
         attend(f"file write result: {result}", source="tool")
         reply = reply[: reply.index("WRITE:")].strip() or "(wrote file)"
+
+    screenshot_path = parse_screenshot(reply)
+    if screenshot_path:
+        ui_print(f"\n  [screenshot: {screenshot_path}]")
+        result = take_screenshot(screenshot_path)
+        ui_print(f"  {result}\n")
+        attend(f"screenshot result: {result}", source="tool")
+        reply = reply[: reply.index("SCREENSHOT:")].strip() or "(took screenshot)"
+
+    click_coords = parse_click(reply)
+    if click_coords:
+        x, y = click_coords
+        ui_print(f"\n  [click: {x},{y}]")
+        result = mouse_click(x, y)
+        ui_print(f"  {result}\n")
+        attend(f"click result: {result}", source="tool")
+        reply = reply[: reply.index("CLICK:")].strip() or "(clicked)"
+
+    type_text = parse_type(reply)
+    if type_text:
+        ui_print(f"\n  [type: {type_text}]")
+        result = keyboard_type(type_text)
+        ui_print(f"  {result}\n")
+        attend(f"type result: {result}", source="tool")
+        reply = reply[: reply.index("TYPE:")].strip() or "(typed)"
 
     # store exchange in history (user and autonomous only)
     history_append("user", context["input"], source=source)
