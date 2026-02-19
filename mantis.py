@@ -117,6 +117,32 @@ def _ensure_computer_use_deps() -> None:
 
 
 _ensure_computer_use_deps()
+
+
+def _ensure_playwright_firefox() -> None:
+    """Ensure Playwright and Firefox are installed."""
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.firefox.launch(headless=True)
+            browser.close()
+    except Exception:
+        print("[setup] installing playwright firefox...")
+        try:
+            subprocess.run(
+                "playwright install firefox",
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            print("[setup] playwright firefox ready")
+        except Exception as e:
+            print(f"[setup] playwright install failed: {e}")
+
+
+_ensure_playwright_firefox()
 db = chromadb.PersistentClient(str(MEMORY_DIR))
 collection = db.get_or_create_collection("events")
 
@@ -555,7 +581,8 @@ def keyboard_type(text: str) -> str:
         return f"type error: {e}"
 
 
-def web_search(query: str) -> str:
+def _search_tier1(query: str) -> str:
+    """DuckDuckGo instant answer API."""
     try:
         safe_query = urllib.parse.quote_plus(query)
         url = (
@@ -570,7 +597,7 @@ def web_search(query: str) -> str:
             timeout=15,
         )
         if result.returncode != 0:
-            return f"search failed: {result.stderr.strip()}"
+            return ""
 
         data = json.loads(result.stdout)
         parts: list[str] = []
@@ -588,11 +615,49 @@ def web_search(query: str) -> str:
                         if isinstance(nested, dict) and isinstance(nested.get("Text"), str):
                             parts.append(nested["Text"])
 
-        if not parts:
-            return f"no results for: {query}"
-        return f"search results for '{query}':\n" + "\n---\n".join(parts[:5])
-    except Exception as e:
-        return f"search error: {e}"
+        return "\n---\n".join(parts[:5]) if parts else ""
+    except Exception:
+        return ""
+
+
+def _search_tier2(query: str) -> str:
+    """Playwright headless scrape of DuckDuckGo results page."""
+    try:
+        from playwright.sync_api import sync_playwright
+
+        safe_query = urllib.parse.quote_plus(query)
+        url = f"https://duckduckgo.com/?q={safe_query}&ia=web"
+        with sync_playwright() as p:
+            browser = p.firefox.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, timeout=15000)
+            page.wait_for_timeout(2000)
+            snippets = page.eval_on_selector_all(
+                "[data-result='snippet'], .result__snippet, .OgdwYG",
+                "els => els.map(e => e.innerText).filter(t => t.length > 20)",
+            )
+            browser.close()
+            if not snippets:
+                return ""
+            return "\n---\n".join(snippets[:5])
+    except Exception:
+        return ""
+
+
+def web_search(query: str) -> str:
+    """
+    Tiered search — fast API first, then Playwright scrape when thin.
+    """
+    result = _search_tier1(query)
+    if len(result) >= 100:
+        return f"search results for '{query}':\n{result}"
+
+    ui_print("  [tier 1 thin, trying playwright scrape...]")
+    result = _search_tier2(query)
+    if result:
+        return f"search results for '{query}' (scraped):\n{result}"
+
+    return f"no results found for: {query}"
 
 
 def web_fetch(url: str) -> str:
