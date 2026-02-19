@@ -6,6 +6,7 @@ Memory: ChromaDB (vector) + SQLite FTS5 (keyword) + MEMORY.md (markdown)
 Safety: Lane Queue (serial FIFO per source)
 """
 import hashlib
+import json
 import os
 import re
 import select
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import uuid
 from collections import defaultdict
 from datetime import datetime
@@ -492,6 +494,16 @@ def parse_type(reply: str) -> str | None:
     return m.group(1).strip() if m else None
 
 
+def parse_search(reply: str) -> str | None:
+    m = re.search(r"SEARCH:\s*(.+)", reply)
+    return m.group(1).strip() if m else None
+
+
+def parse_fetch(reply: str) -> str | None:
+    m = re.search(r"FETCH:\s*(https?://\S+)", reply)
+    return m.group(1).strip() if m else None
+
+
 def take_screenshot(path: str) -> str:
     try:
         p = Path(path).expanduser()
@@ -543,6 +555,67 @@ def keyboard_type(text: str) -> str:
         return f"type error: {e}"
 
 
+def web_search(query: str) -> str:
+    try:
+        safe_query = urllib.parse.quote_plus(query)
+        url = (
+            "https://api.duckduckgo.com/"
+            f"?q={safe_query}&format=json&no_html=1&skip_disambig=1"
+        )
+        result = subprocess.run(
+            f"curl -sL {shlex.quote(url)}",
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode != 0:
+            return f"search failed: {result.stderr.strip()}"
+
+        data = json.loads(result.stdout)
+        parts: list[str] = []
+        abstract = data.get("Abstract")
+        if isinstance(abstract, str) and abstract.strip():
+            parts.append(abstract.strip())
+
+        related = data.get("RelatedTopics", [])
+        if isinstance(related, list):
+            for topic in related[:3]:
+                if isinstance(topic, dict) and isinstance(topic.get("Text"), str):
+                    parts.append(topic["Text"])
+                elif isinstance(topic, dict) and isinstance(topic.get("Topics"), list):
+                    for nested in topic["Topics"][:2]:
+                        if isinstance(nested, dict) and isinstance(nested.get("Text"), str):
+                            parts.append(nested["Text"])
+
+        if not parts:
+            return f"no results for: {query}"
+        return f"search results for '{query}':\n" + "\n---\n".join(parts[:5])
+    except Exception as e:
+        return f"search error: {e}"
+
+
+def web_fetch(url: str) -> str:
+    try:
+        result = subprocess.run(
+            f"curl -sL --max-time 10 -A 'Mozilla/5.0' {shlex.quote(url)}",
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode != 0:
+            return f"fetch failed: {result.stderr.strip()}"
+
+        text = re.sub(r"<[^>]+>", " ", result.stdout)
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            return f"fetch produced no text: {url}"
+        return text[:2000] if len(text) > 2000 else text
+    except Exception as e:
+        return f"fetch error: {e}"
+
+
 # -- Autonomous ---------------------------------------------------------------
 _prompt_index = 0
 
@@ -561,6 +634,8 @@ HEARTBEAT_PROMPTS = [
     "What files have changed recently that the user might care about?",
     # Reminder surface
     "Did the user mention anything they wanted to follow up on later? Surface it now.",
+    # Curiosity
+    "You're curious about something the user mentioned recently. Search for it. SEARCH: <topic from memory>",
 ]
 
 
@@ -701,7 +776,7 @@ def process_events_once() -> None:
             if not context:
                 continue
             reply = act(context)
-            if source in {"autonomous", "shell", "shell_journal"}:
+            if source in {"autonomous", "shell", "shell_journal", "search"}:
                 ui_print(f"\n[mantis]: {reply}\n")
             elif source not in {"agent_echo", "tool"}:
                 ui_print(f"\nagent: {reply}\n")
@@ -785,6 +860,8 @@ def act(context: dict) -> str:
         "  SCREENSHOT: <filepath>\n"
         "  CLICK: <x> <y>\n"
         "  TYPE: <text>\n\n"
+        "  SEARCH: <query>\n"
+        "  FETCH: <url>\n\n"
         "Tool result will be fed back. Otherwise reply directly."
     )
 
@@ -874,6 +951,22 @@ def act(context: dict) -> str:
         ui_print(f"  {result}\n")
         attend(f"type result: {result}", source="tool")
         reply = reply[: reply.index("TYPE:")].strip() or "(typed)"
+
+    search_query = parse_search(reply)
+    if search_query:
+        ui_print(f"\n  [searching: {search_query}]")
+        result = web_search(search_query)
+        ui_print(f"  ({len(result)} chars)\n")
+        attend(f"search results: {result}", source="search")
+        reply = reply[: reply.index("SEARCH:")].strip() or "(searched)"
+
+    fetch_url = parse_fetch(reply)
+    if fetch_url:
+        ui_print(f"\n  [fetching: {fetch_url}]")
+        result = web_fetch(fetch_url)
+        ui_print(f"  ({len(result)} chars)\n")
+        attend(f"fetched content from {fetch_url}:\n{result}", source="search")
+        reply = reply[: reply.index("FETCH:")].strip() or "(fetched)"
 
     # store exchange in history (user and autonomous only)
     history_append("user", context["input"], source=source)
