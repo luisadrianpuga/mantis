@@ -37,6 +37,7 @@ AUTONOMOUS_INTERVAL_SEC = int(os.getenv("AUTONOMOUS_INTERVAL_SEC", "300"))
 WATCH_PATH = os.getenv("WATCH_PATH", ".")
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "10"))
 SHELL_LOG = Path(os.getenv("SHELL_LOG", ".agent/shell.log"))
+MAX_LLM_TIMEOUT = int(os.getenv("MAX_LLM_TIMEOUT", "120"))
 
 DB_PATH = MEMORY_DIR / "fts.db"
 MEMORY_MD = Path(".agent/MEMORY.md")
@@ -286,6 +287,25 @@ ASYNC_COMMAND_PREFIXES = [
     "curl",
     "git clone",
 ]
+
+INTERACTIVE_COMMANDS = [
+    "htop",
+    "top",
+    "vim",
+    "vi",
+    "nano",
+    "less",
+    "more",
+    "man",
+    "watch",
+    "tail -f",
+    "journalctl",
+]
+
+SAFE_ALTERNATIVES = {
+    "htop": "cat /proc/loadavg && free -h && df -h",
+    "top": "cat /proc/loadavg && free -h && df -h",
+}
 
 
 def _log_to_shell_journal(cmd: str, result: str, actor: str = "mantis") -> None:
@@ -586,7 +606,10 @@ def process_events_once() -> None:
 
 def event_loop():
     while not _event_loop_stop.is_set():
-        process_events_once()
+        try:
+            process_events_once()
+        except Exception as e:
+            ui_print(f"\n[error] event loop recovered: {e}\n")
         time.sleep(0.2)
 
 
@@ -666,24 +689,43 @@ def act(context: dict) -> str:
     r = httpx.post(
         f"{LLM_BASE}/chat/completions",
         json={"model": MODEL, "messages": messages, "max_tokens": MAX_TOKENS},
-        timeout=60,
+        timeout=MAX_LLM_TIMEOUT,
     )
     r.raise_for_status()
     reply = r.json()["choices"][0]["message"]["content"].strip()
 
     cmd = parse_command(reply)
     if cmd:
-        normalized = cmd.strip().lower()
-        is_long = any(normalized.startswith(prefix) for prefix in ASYNC_COMMAND_PREFIXES)
-        if is_long:
-            ui_print(f"\n  [running async: {cmd}]")
-            run_command_async(cmd)
+        stripped = cmd.strip().lower()
+        base = stripped.split()[0] if stripped else ""
+        if any(stripped.startswith(c) for c in INTERACTIVE_COMMANDS):
+            alt = SAFE_ALTERNATIVES.get(base)
+            if alt:
+                ui_print(f"\n  [blocked interactive: {cmd} -> using: {alt}]")
+                cmd = alt
+            else:
+                ui_print(f"\n  [blocked interactive command: {cmd}]")
+                attend(
+                    f"blocked: {cmd} is interactive — suggest a non-interactive alternative",
+                    source="tool",
+                )
+                reply = reply[: reply.index("COMMAND:")].strip() or f"(blocked: {cmd})"
+                cmd = None
+        if cmd is None:
+            # Already handled blocked command path.
+            pass
         else:
-            ui_print(f"\n  [running: {cmd}]")
-            result = run_command(cmd)
-            ui_print(f"  {result}\n")
-            attend(f"command result for `{cmd}`:\n{result}", source="tool")
-        reply = reply[: reply.index("COMMAND:")].strip() or "(ran command)"
+            normalized = cmd.strip().lower()
+            is_long = any(normalized.startswith(prefix) for prefix in ASYNC_COMMAND_PREFIXES)
+            if is_long:
+                ui_print(f"\n  [running async: {cmd}]")
+                run_command_async(cmd)
+            else:
+                ui_print(f"\n  [running: {cmd}]")
+                result = run_command(cmd)
+                ui_print(f"  {result}\n")
+                attend(f"command result for `{cmd}`:\n{result}", source="tool")
+            reply = reply[: reply.index("COMMAND:")].strip() or "(ran command)"
 
     read_path = parse_read(reply)
     if read_path:

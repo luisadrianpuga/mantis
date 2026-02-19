@@ -48,6 +48,11 @@ Some commands run asynchronously and complete later.
 When you emit long-running installs/downloads, assume completion will arrive as a new shell event.
 When shell results arrive, react to them immediately and chain the next concrete step if needed.
 
+## System health
+Never use top, htop, or any interactive monitor — they hang the terminal.
+For system health always use:
+COMMAND: cat /proc/loadavg && free -h && df -h
+
 ## Autonomy
 You are allowed to run terminal commands when:
 - The user asks you to
