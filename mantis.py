@@ -8,8 +8,10 @@ Safety: Lane Queue (serial FIFO per source)
 import hashlib
 import os
 import re
+import select
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -545,28 +547,44 @@ def act(context: dict) -> str:
 
 
 # -- Main loop ----------------------------------------------------------------
+def input_loop():
+    """Non-blocking stdin loop so autonomous output can print immediately."""
+    while not _event_loop_stop.is_set():
+        _input_waiting.set()
+        ready, _, _ = select.select([sys.stdin], [], [], 0.2)
+        if not ready:
+            continue
+
+        line = sys.stdin.readline()
+        if line == "":
+            # EOF; avoid tight loops and allow graceful shutdown.
+            time.sleep(0.1)
+            continue
+
+        user_input = line.strip()
+        if not user_input:
+            ui_print()
+            continue
+        if user_input.lower() in {"exit", "quit"}:
+            _event_loop_stop.set()
+            break
+        attend(user_input, source="user")
+
+
 def main():
     threading.Thread(target=event_loop, daemon=True).start()
     threading.Thread(target=autonomous_loop, daemon=True).start()
     threading.Thread(target=start_watcher, daemon=True).start()
+    threading.Thread(target=input_loop, daemon=True).start()
 
     ui_print("agent ready. ctrl+c to exit.\n", redraw_prompt=False)
-    while True:
-        try:
-            _input_waiting.set()
-            user_input = input("you: ").strip()
-            _input_waiting.clear()
-            if not user_input:
-                continue
-            if user_input.lower() in {"exit", "quit"}:
-                _event_loop_stop.set()
-                break
-            attend(user_input, source="user")
-        except KeyboardInterrupt:
-            _input_waiting.clear()
-            _event_loop_stop.set()
-            ui_print("\nbye.", redraw_prompt=False)
-            break
+    print("you: ", end="", flush=True)
+    _input_waiting.set()
+    try:
+        _event_loop_stop.wait()
+    except KeyboardInterrupt:
+        _event_loop_stop.set()
+        ui_print("\nbye.", redraw_prompt=False)
 
 
 if __name__ == "__main__":
