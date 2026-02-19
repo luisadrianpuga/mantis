@@ -10,7 +10,6 @@ import os
 import re
 import select
 import sqlite3
-import subprocess
 import sys
 import threading
 import time
@@ -21,6 +20,7 @@ from pathlib import Path
 from queue import Empty, Queue
 import chromadb
 import httpx
+import pexpect
 from dotenv import load_dotenv
 from docs.assets.start_up_logo import start_up_logo as START_UP_LOGO
 
@@ -236,17 +236,91 @@ def load_soul() -> str:
 
 
 # -- Tools --------------------------------------------------------------------
+_shell: pexpect.spawn | None = None
+_shell_lock = threading.Lock()
+_shell_io_lock = threading.Lock()
+_SHELL_PROMPT = "__MANTIS_DONE__"
+
+ASYNC_COMMAND_PREFIXES = [
+    "pip install",
+    "playwright install",
+    "npm install",
+    "apt install",
+    "wget",
+    "curl",
+    "git clone",
+]
+
+
+def _reset_shell() -> None:
+    global _shell
+    with _shell_lock:
+        if _shell is not None:
+            try:
+                _shell.terminate(force=True)
+            except Exception:
+                pass
+        _shell = None
+
+
+def _get_shell() -> pexpect.spawn:
+    global _shell
+    with _shell_lock:
+        if _shell is None or not _shell.isalive():
+            shell = pexpect.spawn(
+                "/bin/bash",
+                encoding="utf-8",
+                timeout=None,
+            )
+            shell.sendline(f'export PS1="{_SHELL_PROMPT} "')
+            shell.expect(_SHELL_PROMPT, timeout=5)
+            _shell = shell
+        return _shell
+
+
+def _shell_output(output: str, cmd: str) -> str:
+    lines = output.splitlines()
+    if lines and lines[0].strip() == cmd.strip():
+        lines = lines[1:]
+    cleaned = "\n".join(lines).strip()
+    return cleaned or "(no output)"
+
+
+def _run_shell_command(cmd: str, timeout: int) -> str:
+    with _shell_io_lock:
+        shell = _get_shell()
+        shell.sendline(cmd)
+        shell.expect(_SHELL_PROMPT, timeout=timeout)
+        return _shell_output(shell.before.strip(), cmd)
+
+
+def run_command_async(cmd: str) -> None:
+    """Run a command in the persistent shell and feed result back as events."""
+
+    def _run():
+        try:
+            result = _run_shell_command(cmd, timeout=60)
+            attend(f"shell result for `{cmd}`:\n{result}", source="shell")
+        except pexpect.TIMEOUT:
+            _reset_shell()
+            attend(f"shell result for `{cmd}`: timed out after 60s", source="shell")
+        except Exception as e:
+            _reset_shell()
+            attend(f"shell result for `{cmd}`: error — {e}", source="shell")
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def run_command(cmd: str) -> str:
+    """Synchronous command execution over the persistent shell."""
     try:
-        result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=30
-        )
-        out = result.stdout.strip() or result.stderr.strip() or "(no output)"
-        return f"$ {cmd}\n{out}"
-    except subprocess.TimeoutExpired:
-        return f"$ {cmd}\n(timed out after 30s)"
+        return _run_shell_command(cmd, timeout=30)
+    except pexpect.TIMEOUT:
+        _reset_shell()
+        return "(timed out after 30s; shell session reset)"
     except Exception as e:
-        return f"$ {cmd}\n(error: {e})"
+        _reset_shell()
+        return f"(error: {e})"
 
 
 def read_file(path: str) -> str:
@@ -420,7 +494,7 @@ def process_events_once() -> None:
             if not context:
                 continue
             reply = act(context)
-            if source == "autonomous":
+            if source in {"autonomous", "shell"}:
                 ui_print(f"\n[mantis]: {reply}\n")
             elif source not in {"agent_echo", "tool"}:
                 ui_print(f"\nagent: {reply}\n")
@@ -515,10 +589,16 @@ def act(context: dict) -> str:
 
     cmd = parse_command(reply)
     if cmd:
-        ui_print(f"\n  [running: {cmd}]")
-        result = run_command(cmd)
-        ui_print(f"  {result}\n")
-        attend(f"command result: {result}", source="tool")
+        normalized = cmd.strip().lower()
+        is_long = any(normalized.startswith(prefix) for prefix in ASYNC_COMMAND_PREFIXES)
+        if is_long:
+            ui_print(f"\n  [running async: {cmd}]")
+            run_command_async(cmd)
+        else:
+            ui_print(f"\n  [running: {cmd}]")
+            result = run_command(cmd)
+            ui_print(f"  {result}\n")
+            attend(f"command result for `{cmd}`:\n{result}", source="tool")
         reply = reply[: reply.index("COMMAND:")].strip() or "(ran command)"
 
     read_path = parse_read(reply)

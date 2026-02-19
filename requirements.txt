@@ -2,3 +2,4 @@ httpx
 chromadb
 python-dotenv
 watchdog
+pexpect
