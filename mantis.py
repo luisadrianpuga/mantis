@@ -36,6 +36,7 @@ EMBEDDING_BACKEND = os.getenv("EMBEDDING_BACKEND", "hash").lower()
 AUTONOMOUS_INTERVAL_SEC = int(os.getenv("AUTONOMOUS_INTERVAL_SEC", "300"))
 WATCH_PATH = os.getenv("WATCH_PATH", ".")
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "10"))
+SHELL_LOG = Path(os.getenv("SHELL_LOG", ".agent/shell.log"))
 
 DB_PATH = MEMORY_DIR / "fts.db"
 MEMORY_MD = Path(".agent/MEMORY.md")
@@ -45,6 +46,39 @@ print(START_UP_LOGO)
 
 # -- Boot ---------------------------------------------------------------------
 MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _ensure_shell_journal_hooked() -> None:
+    """
+    Auto-install PROMPT_COMMAND hook into ~/.bashrc for shared shell awareness.
+    Idempotent; safe to call on every boot.
+    """
+    bashrc = Path.home() / ".bashrc"
+    marker = "# mantis shell journal"
+    journal_path = str(SHELL_LOG.expanduser().resolve())
+    hook = (
+        f"\n{marker}\n"
+        "_mantis_log_command() {\n"
+        "    local last_cmd\n"
+        "    last_cmd=$(history 1 | sed \"s/^[ ]*[0-9]*[ ]*//\" 2>/dev/null)\n"
+        "    if [ -n \"$last_cmd\" ]; then\n"
+        f"        echo \"$(date -u +%FT%T) [you]: $last_cmd\" >> {journal_path} 2>/dev/null\n"
+        "    fi\n"
+        "}\n"
+        "export PROMPT_COMMAND='_mantis_log_command'\n"
+    )
+    try:
+        existing = bashrc.read_text(encoding="utf-8") if bashrc.exists() else ""
+        if marker not in existing:
+            with open(bashrc, "a", encoding="utf-8") as f:
+                f.write(hook)
+            print("[setup] shell journal hooked into ~/.bashrc")
+            print("[setup] run: source ~/.bashrc  (or open a new terminal)")
+    except Exception as e:
+        print(f"[setup] could not hook ~/.bashrc: {e} — add PROMPT_COMMAND manually")
+
+
+_ensure_shell_journal_hooked()
 db = chromadb.PersistentClient(str(MEMORY_DIR))
 collection = db.get_or_create_collection("events")
 
@@ -214,6 +248,8 @@ _watcher_lock = threading.Lock()
 _last_seen_fs: dict[str, float] = {}
 _fs_lock = threading.Lock()
 _FS_DEBOUNCE_SEC = 10.0
+_shell_journal_lock = threading.Lock()
+_last_shell_journal_line = ""
 _console_lock = threading.Lock()
 _input_waiting = threading.Event()
 
@@ -250,6 +286,24 @@ ASYNC_COMMAND_PREFIXES = [
     "curl",
     "git clone",
 ]
+
+
+def _log_to_shell_journal(cmd: str, result: str, actor: str = "mantis") -> None:
+    ts = datetime.utcnow().isoformat()
+    try:
+        SHELL_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(SHELL_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{ts} [{actor}]: {cmd}\n")
+            f.write(f"{ts} [result]: {result[:500]}\n")
+    except Exception:
+        pass
+
+
+def _is_shell_log_path(path: str) -> bool:
+    try:
+        return Path(path).resolve() == SHELL_LOG.expanduser().resolve()
+    except Exception:
+        return path.replace("\\", "/").endswith("shell.log")
 
 
 def _reset_shell() -> None:
@@ -300,13 +354,18 @@ def run_command_async(cmd: str) -> None:
     def _run():
         try:
             result = _run_shell_command(cmd, timeout=60)
+            _log_to_shell_journal(cmd, result, actor="mantis")
             attend(f"shell result for `{cmd}`:\n{result}", source="shell")
         except pexpect.TIMEOUT:
             _reset_shell()
-            attend(f"shell result for `{cmd}`: timed out after 60s", source="shell")
+            result = "timed out after 60s"
+            _log_to_shell_journal(cmd, result, actor="mantis")
+            attend(f"shell result for `{cmd}`: {result}", source="shell")
         except Exception as e:
             _reset_shell()
-            attend(f"shell result for `{cmd}`: error — {e}", source="shell")
+            result = f"error — {e}"
+            _log_to_shell_journal(cmd, result, actor="mantis")
+            attend(f"shell result for `{cmd}`: {result}", source="shell")
 
     threading.Thread(target=_run, daemon=True).start()
 
@@ -314,13 +373,19 @@ def run_command_async(cmd: str) -> None:
 def run_command(cmd: str) -> str:
     """Synchronous command execution over the persistent shell."""
     try:
-        return _run_shell_command(cmd, timeout=30)
+        result = _run_shell_command(cmd, timeout=30)
+        _log_to_shell_journal(cmd, result, actor="mantis")
+        return result
     except pexpect.TIMEOUT:
         _reset_shell()
-        return "(timed out after 30s; shell session reset)"
+        result = "(timed out after 30s; shell session reset)"
+        _log_to_shell_journal(cmd, result, actor="mantis")
+        return result
     except Exception as e:
         _reset_shell()
-        return f"(error: {e})"
+        result = f"(error: {e})"
+        _log_to_shell_journal(cmd, result, actor="mantis")
+        return result
 
 
 def read_file(path: str) -> str:
@@ -458,10 +523,29 @@ def start_watcher():
             self._handle(event, "deleted")
 
         def _handle(self, event, event_type: str):
+            global _last_shell_journal_line
             if event.is_directory:
                 return
             path = str(getattr(event, "src_path", ""))
-            if not path or _should_ignore_fs_path(path):
+            if not path:
+                return
+
+            if _is_shell_log_path(path) and event_type == "modified":
+                try:
+                    lines = Path(path).read_text(encoding="utf-8").strip().splitlines()
+                    if lines:
+                        last = lines[-1]
+                        with _shell_journal_lock:
+                            if last == _last_shell_journal_line:
+                                return
+                            _last_shell_journal_line = last
+                        if "[you]:" in last:
+                            attend(f"you ran in terminal: {last}", source="shell_journal")
+                except Exception:
+                    pass
+                return
+
+            if _should_ignore_fs_path(path):
                 return
             if _debounced_fs_path(path):
                 return
@@ -494,7 +578,7 @@ def process_events_once() -> None:
             if not context:
                 continue
             reply = act(context)
-            if source in {"autonomous", "shell"}:
+            if source in {"autonomous", "shell", "shell_journal"}:
                 ui_print(f"\n[mantis]: {reply}\n")
             elif source not in {"agent_echo", "tool"}:
                 ui_print(f"\nagent: {reply}\n")
