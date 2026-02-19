@@ -45,6 +45,7 @@ MAX_LLM_TIMEOUT = int(os.getenv("MAX_LLM_TIMEOUT", "120"))
 
 DB_PATH = MEMORY_DIR / "fts.db"
 MEMORY_MD = Path(".agent/MEMORY.md")
+SKILLS_DIR = Path(".agent/skills")
 EMBED_DIM = 384
 
 print(START_UP_LOGO)
@@ -530,6 +531,11 @@ def parse_fetch(reply: str) -> str | None:
     return m.group(1).strip() if m else None
 
 
+def parse_skill(reply: str) -> str | None:
+    m = re.search(r"SKILL:\s*(\S+)", reply)
+    return m.group(1).strip() if m else None
+
+
 def take_screenshot(path: str) -> str:
     try:
         p = Path(path).expanduser()
@@ -681,6 +687,53 @@ def web_fetch(url: str) -> str:
         return f"fetch error: {e}"
 
 
+def load_skill(source: str) -> str:
+    """Load a skill from URL or local path, persist it, and return summary."""
+    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+
+    if source.startswith("http://") or source.startswith("https://"):
+        content = web_fetch(source)
+        if content.startswith("fetch"):
+            return f"skill load failed: {content}"
+        name = source.rstrip("/").split("/")[-1].split("?")[0].strip() or "skill.md"
+        if not name.endswith(".md"):
+            name = f"{name}.md"
+        skill_path = SKILLS_DIR / name
+        try:
+            skill_path.write_text(content, encoding="utf-8")
+        except Exception as e:
+            return f"skill load failed: {e}"
+        return f"skill loaded from {source} -> saved to {skill_path}\n\n{content[:500]}"
+
+    try:
+        p = Path(source)
+        content = p.read_text(encoding="utf-8")
+        dest = SKILLS_DIR / p.name
+        if p.resolve() != dest.resolve():
+            dest.write_text(content, encoding="utf-8")
+        return f"skill loaded from {source}\n\n{content[:500]}"
+    except Exception as e:
+        return f"skill load failed: {e}"
+
+
+def load_all_skills() -> str:
+    """Load all skill files and combine compactly for the system prompt."""
+    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+    skills = sorted(SKILLS_DIR.glob("*.md"))
+    if not skills:
+        return ""
+
+    parts = []
+    for skill in skills:
+        try:
+            content = skill.read_text(encoding="utf-8").strip()
+        except Exception:
+            continue
+        if content:
+            parts.append(f"### Skill: {skill.stem}\n{content[:600]}")
+    return "\n\n".join(parts) if parts else ""
+
+
 # -- Autonomous ---------------------------------------------------------------
 _prompt_index = 0
 
@@ -808,6 +861,19 @@ def start_watcher():
                     pass
                 return
 
+            normalized = path.replace("\\", "/")
+            if "/skills/" in f"/{normalized}/" and event_type in {"created", "modified"}:
+                try:
+                    content = Path(path).read_text(encoding="utf-8").strip()
+                    if content:
+                        attend(
+                            f"new skill available: {Path(path).stem}\n{content[:300]}",
+                            source="skill",
+                        )
+                except Exception:
+                    pass
+                return
+
             if _should_ignore_fs_path(path):
                 return
             if _debounced_fs_path(path):
@@ -841,7 +907,7 @@ def process_events_once() -> None:
             if not context:
                 continue
             reply = act(context)
-            if source in {"autonomous", "shell", "shell_journal", "search"}:
+            if source in {"autonomous", "shell", "shell_journal", "search", "skill"}:
                 ui_print(f"\n[mantis]: {reply}\n")
             elif source not in {"agent_echo", "tool"}:
                 ui_print(f"\nagent: {reply}\n")
@@ -910,11 +976,14 @@ def associate(event: dict) -> dict | None:
 # -- Rule 3: ACT --------------------------------------------------------------
 def act(context: dict) -> str:
     soul = load_soul()
+    skills_block = load_all_skills()
     memory_block = "\n".join(f"- {m}" for m in context["memory"]) or "(none yet)"
     source = context.get("source", "user")
 
-    system = (
-        f"{soul}\n\n"
+    system = f"{soul}\n\n"
+    if skills_block:
+        system += f"---\n## Loaded Skills\n{skills_block}\n\n"
+    system += (
         "---\n"
         f"Relevant memory:\n{memory_block}\n\n"
         "---\n"
@@ -926,7 +995,8 @@ def act(context: dict) -> str:
         "  CLICK: <x> <y>\n"
         "  TYPE: <text>\n\n"
         "  SEARCH: <query>\n"
-        "  FETCH: <url>\n\n"
+        "  FETCH: <url>\n"
+        "  SKILL: <url-or-path>\n\n"
         "Tool result will be fed back. Otherwise reply directly."
     )
 
@@ -1032,6 +1102,14 @@ def act(context: dict) -> str:
         ui_print(f"  ({len(result)} chars)\n")
         attend(f"fetched content from {fetch_url}:\n{result}", source="search")
         reply = reply[: reply.index("FETCH:")].strip() or "(fetched)"
+
+    skill_source = parse_skill(reply)
+    if skill_source:
+        ui_print(f"\n  [loading skill: {skill_source}]")
+        result = load_skill(skill_source)
+        ui_print(f"  ({len(result)} chars)\n")
+        attend(f"skill loaded: {result}", source="skill")
+        reply = reply[: reply.index("SKILL:")].strip() or "(loaded skill)"
 
     # store exchange in history (user and autonomous only)
     history_append("user", context["input"], source=source)
