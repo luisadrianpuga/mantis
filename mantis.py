@@ -280,21 +280,54 @@ def parse_write(reply: str) -> tuple[str, str] | None:
 
 
 # -- Autonomous ---------------------------------------------------------------
-def autonomous_prompt_for_hour(hour_utc: int) -> str:
-    if 6 <= hour_utc < 10:
-        return (
-            "It's morning. Reflect on the day ahead using recent memory and identify "
-            "one concrete priority."
-        )
-    if 18 <= hour_utc < 22:
-        return (
-            "It's evening. Review what was done today and explicitly note unresolved "
-            "items to revisit."
-        )
-    return (
-        "You're in an idle reflection window. Synthesize recent memories into a short "
-        "summary and store one durable insight."
-    )
+_prompt_index = 0
+
+HEARTBEAT_PROMPTS = [
+    # Unfinished work
+    "What has the user asked you to do that isn't finished yet? Be specific and surface it.",
+    # Hardware awareness
+    "Check system health. COMMAND: uptime && df -h && free -h",
+    # Todo check
+    "Is there a todo list? If so read it and remind the user of anything incomplete. READ: todo_list.txt",
+    # Memory synthesis
+    "Review recent memory. What's the single most important thing the user is working on right now?",
+    # Open question
+    "Based on recent memory, what's one thing you're uncertain about that would help to clarify with the user?",
+    # File awareness
+    "What files have changed recently that the user might care about?",
+    # Reminder surface
+    "Did the user mention anything they wanted to follow up on later? Surface it now.",
+]
+
+
+def _primary_user_name_from_soul() -> str | None:
+    soul = load_soul()
+    m = re.search(r"Primary user:\s*(.+)", soul, flags=re.IGNORECASE)
+    if not m:
+        return None
+    name = m.group(1).strip()
+    if not name or name.lower() in {"[name]", "name", "unknown", "n/a"}:
+        return None
+    return name
+
+
+def next_heartbeat_prompt() -> str:
+    global _prompt_index
+    hour = datetime.utcnow().hour
+    user_name = _primary_user_name_from_soul()
+
+    if 6 <= hour < 10:
+        prefix = "Good morning. "
+    elif 18 <= hour < 22:
+        prefix = "End of day check. "
+    else:
+        prefix = ""
+
+    prompt = HEARTBEAT_PROMPTS[_prompt_index % len(HEARTBEAT_PROMPTS)]
+    _prompt_index += 1
+    if user_name:
+        prompt = prompt.replace("the user", user_name).replace("user", user_name)
+    return f"{prefix}{prompt}"
 
 
 def autonomous_loop():
@@ -302,8 +335,7 @@ def autonomous_loop():
         _event_loop_stop.wait(AUTONOMOUS_INTERVAL_SEC)
         if _event_loop_stop.is_set():
             break
-        prompt = autonomous_prompt_for_hour(datetime.utcnow().hour)
-        attend(prompt, source="autonomous")
+        attend(next_heartbeat_prompt(), source="autonomous")
 
 
 # -- Filesystem watcher -------------------------------------------------------
