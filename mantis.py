@@ -30,6 +30,18 @@ from docs.assets.start_up_logo import start_up_logo as START_UP_LOGO
 
 # -- Config -------------------------------------------------------------------
 load_dotenv()
+
+
+def _env_int(name: str, default: int = 0) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 LLM_BASE = os.getenv("LLM_BASE", "http://localhost:8001/v1")
 MODEL = os.getenv("MODEL", "Qwen2.5-14B-Instruct-Q4_K_M.gguf")
 MEMORY_DIR = Path(os.getenv("MEMORY_DIR", ".agent/memory"))
@@ -42,6 +54,8 @@ WATCH_PATH = os.getenv("WATCH_PATH", ".")
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "10"))
 SHELL_LOG = Path(os.getenv("SHELL_LOG", ".agent/shell.log"))
 MAX_LLM_TIMEOUT = int(os.getenv("MAX_LLM_TIMEOUT", "120"))
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
+DISCORD_CHANNEL_ID = _env_int("DISCORD_CHANNEL_ID", 0)
 
 DB_PATH = MEMORY_DIR / "fts.db"
 MEMORY_MD = Path(".agent/MEMORY.md")
@@ -317,6 +331,9 @@ _shell_journal_lock = threading.Lock()
 _last_shell_journal_line = ""
 _console_lock = threading.Lock()
 _input_waiting = threading.Event()
+_discord_client = None
+_discord_loop = None
+_discord_ready = threading.Event()
 
 
 def ui_print(message: str = "", redraw_prompt: bool = True) -> None:
@@ -327,6 +344,71 @@ def ui_print(message: str = "", redraw_prompt: bool = True) -> None:
             print("", flush=True)
         if redraw_prompt and _input_waiting.is_set():
             print("you: ", end="", flush=True)
+
+
+def _start_discord() -> None:
+    """Start Discord client and route channel messages into the event bus."""
+    global _discord_client, _discord_loop
+
+    if not DISCORD_TOKEN or DISCORD_CHANNEL_ID <= 0:
+        return
+
+    try:
+        import asyncio
+        import discord
+    except Exception as e:
+        ui_print(f"[discord] unavailable: {e}")
+        return
+
+    intents = discord.Intents.default()
+    intents.message_content = True
+    intents.members = True
+    client = discord.Client(intents=intents)
+
+    @client.event
+    async def on_ready():
+        global _discord_client, _discord_loop
+        _discord_client = client
+        _discord_loop = asyncio.get_running_loop()
+        _discord_ready.set()
+        ui_print(f"[discord] connected as {client.user}")
+
+    @client.event
+    async def on_message(message):
+        if message.author == client.user:
+            return
+        if message.channel.id != DISCORD_CHANNEL_ID:
+            return
+        if not message.content:
+            return
+        attend(message.content, source="discord")
+
+    try:
+        asyncio.run(client.start(DISCORD_TOKEN))
+    except Exception as e:
+        ui_print(f"[discord] stopped: {e}")
+
+
+def discord_post(message: str) -> None:
+    """Post a message back to the configured Discord channel."""
+    if not message or not _discord_client or not _discord_loop:
+        return
+    if not _discord_ready.is_set() or DISCORD_CHANNEL_ID <= 0:
+        return
+
+    import asyncio
+
+    async def _send():
+        channel = _discord_client.get_channel(DISCORD_CHANNEL_ID)
+        if channel is None:
+            return
+        for i in range(0, len(message), 1900):
+            await channel.send(message[i : i + 1900])
+
+    try:
+        asyncio.run_coroutine_threadsafe(_send(), _discord_loop)
+    except Exception:
+        pass
 
 
 # -- Soul ---------------------------------------------------------------------
@@ -907,10 +989,19 @@ def process_events_once() -> None:
             if not context:
                 continue
             reply = act(context)
-            if source in {"autonomous", "shell", "shell_journal", "search", "skill"}:
+            if source in {
+                "autonomous",
+                "shell",
+                "shell_journal",
+                "search",
+                "skill",
+                "discord",
+            }:
                 ui_print(f"\n[mantis]: {reply}\n")
             elif source not in {"agent_echo", "tool"}:
                 ui_print(f"\nagent: {reply}\n")
+            if source in {"discord", "autonomous"}:
+                discord_post(reply)
 
 
 def event_loop():
@@ -1149,6 +1240,7 @@ def main():
     threading.Thread(target=autonomous_loop, daemon=True).start()
     threading.Thread(target=start_watcher, daemon=True).start()
     threading.Thread(target=input_loop, daemon=True).start()
+    threading.Thread(target=_start_discord, daemon=True).start()
 
     ui_print("agent ready. ctrl+c to exit.\n", redraw_prompt=False)
     print("you: ", end="", flush=True)

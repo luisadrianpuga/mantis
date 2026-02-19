@@ -7,59 +7,152 @@
   </picture>
 </p>
 
-Mantis is a local-first Python agent runtime that implements a three-stage loop:
+Mantis is a local-first Python agent runtime with a three-rule loop:
 `ATTEND -> ASSOCIATE -> ACT`.
 
-The system combines:
-- OpenAI-compatible chat completion calls for reasoning
-- hybrid memory retrieval (vector + keyword + markdown log)
-- lightweight tool execution (`COMMAND`, `READ`, `WRITE`)
-- optional autonomous periodic reflection
-- optional filesystem event ingestion
+Current capabilities include:
+- Hybrid memory (Chroma vectors + SQLite FTS5 + markdown log)
+- Persistent shell execution (sync + async)
+- Shared shell journal awareness (`.agent/shell.log`)
+- Autonomous heartbeat prompts (rotating, time-modified)
+- Filesystem watcher ingestion
+- Linux computer-use tools (`SCREENSHOT`, `CLICK`, `TYPE`)
+- Tiered web search (`SEARCH`) and page fetch (`FETCH`)
+- Skill loading from local files or URLs (`SKILL`)
 
 ## Scope
 
-This repository currently provides a single executable runtime (`mantis.py`) intended for local experimentation and research prototyping. It is not packaged as a production service.
+This repo is a single executable runtime (`mantis.py`) for local experimentation and prototyping. It is not packaged as a production service.
 
-## Runtime Model
+## Runtime model
 
-For each event, Mantis performs:
-1. `ATTEND`: queue an event tagged with source and timestamp.
-2. `ASSOCIATE`: retrieve related memories from three stores and persist the new event.
-3. `ACT`: call the configured LLM and optionally execute one tool action.
+For each event, Mantis runs:
+1. `ATTEND`: enqueue an event with source + timestamp.
+2. `ASSOCIATE`: recall related memory and persist the new event.
+3. `ACT`: call the LLM and optionally execute one or more tool directives.
 
-### Event Sources
+Events are processed in per-source serialized lanes (FIFO per source).
 
-Supported event sources in the current implementation:
-- `user` (interactive CLI input)
-- `filesystem` (watchdog events)
-- `autonomous` (timer-triggered prompts)
-- `tool` (tool output fed back to loop)
-- `agent_echo` (agent response persisted to memory)
+## Event sources
 
-### Memory Subsystems
+Current sources in code:
+- `user`
+- `autonomous`
+- `filesystem`
+- `tool`
+- `search`
+- `skill`
+- `shell`
+- `shell_journal`
+- `agent_echo`
 
-Mantis persists and recalls memory through:
-- ChromaDB persistent collection (`events`) for vector retrieval
-- SQLite FTS5 table (`memories`) for keyword retrieval
-- markdown append-only log at `.agent/MEMORY.md`
+## Memory
 
-The retrieved context is deduplicated and provided to the LLM as "Relevant memory".
+Memory layers:
+- ChromaDB collection `events` in `MEMORY_DIR`
+- SQLite FTS5 table `memories` in `MEMORY_DIR/fts.db`
+- Markdown append-only log `.agent/MEMORY.md`
 
-## Tool Interface
+Recall merges vector + keyword + markdown tail, deduplicates, then injects into prompt as relevant memory.
 
-The model can emit at most one primary tool directive per response using strict markers:
+## Tool directives
+
+Mantis can execute these directives from model output:
 - `COMMAND: <shell command>`
 - `READ: <filepath>`
-- `WRITE: <filepath>` followed by full file content
+- `WRITE: <filepath>` + full content
+- `SCREENSHOT: <filepath>`
+- `CLICK: <x> <y>`
+- `TYPE: <text>`
+- `SEARCH: <query>`
+- `FETCH: <url>`
+- `SKILL: <url-or-path>`
 
-Tool results are re-injected as events (`source="tool"`) and influence subsequent turns.
+Tool outcomes are fed back into the event bus and become memory.
+
+## Shell model
+
+Mantis uses a persistent `/bin/bash` via `pexpect`:
+- state survives across commands (`cd`, env vars, etc.)
+- short commands run synchronously
+- long commands run asynchronously and report back on completion
+
+Long-command prefixes currently include installs/downloads (for example `pip install`, `npm install`, `git clone`).
+
+## Shared shell journal
+
+Mantis writes command/result entries to `SHELL_LOG` (default `.agent/shell.log`) and auto-installs a `.bashrc` hook to log user shell commands.
+
+That creates cross-awareness:
+- user commands -> journal -> watcher -> `shell_journal` events
+- mantis commands -> journal entries for auditability
+
+## Autonomous behavior
+
+Autonomous loop fires every `AUTONOMOUS_INTERVAL_SEC` (default 300s) with rotating prompts, including:
+- unfinished work
+- system health checks
+- todo checks
+- memory synthesis
+- open questions
+- file awareness
+- reminders
+- curiosity search prompt
+
+Time-of-day is a modifier:
+- morning UTC adds `Good morning.`
+- evening UTC adds `End of day check.`
+
+If `Primary user:` exists in soul content, prompts personalize user references.
+
+## Web research
+
+`SEARCH` is tiered:
+1. DuckDuckGo instant answer API (fast)
+2. Playwright headless Firefox scrape of DDG results when tier 1 is too thin (`<100` chars)
+
+`FETCH` pulls a specific URL with `curl`, strips HTML tags, and trims text for context.
+
+## Skills system
+
+Skills live in `.agent/skills/*.md` and persist across restarts.
+
+Ways to load:
+- `SKILL: https://.../skill.md` (fetch + save)
+- `SKILL: .agent/skills/local.md` (read local + copy if needed)
+
+Loaded skills are injected into the system prompt under `## Loaded Skills` (trimmed per skill for context control).
+
+Filesystem changes under `/skills/` trigger immediate skill events.
+
+## Computer use (Linux)
+
+Mantis supports blind-first computer control via:
+- `scrot` for screenshots
+- `xdotool` for mouse/keyboard actions
+
+Boot setup:
+- defaults `DISPLAY=:0` when unset
+- attempts to install missing `scrot`/`xdotool`
+- attempts to ensure Playwright Firefox is available
+
+## Input/output behavior
+
+CLI input is non-blocking (`select.select`) in a dedicated thread, so autonomous/shell/search/skill messages can print without waiting for user keystrokes.
+
+Output prefixes:
+- `agent:` for direct user-facing responses
+- `[mantis]:` for autonomous/self-triggered streams (autonomous, shell, shell_journal, search, skill)
+
+Exit with `Ctrl+C` or `exit` / `quit`.
 
 ## Requirements
 
 - Python 3.10+
-- A reachable OpenAI-compatible `/v1/chat/completions` endpoint
-- Dependencies in `requirements.txt`
+- Reachable OpenAI-compatible API endpoint for:
+  - `POST /v1/chat/completions`
+  - optionally `POST /v1/embeddings`
+- Python deps in `requirements.txt`
 
 Install:
 
@@ -70,56 +163,61 @@ pip install -r requirements.txt
 Run:
 
 ```bash
-python mantis.py
+python3 mantis.py
 ```
+
+## Additional runtime tools (system-level)
+
+Some capabilities rely on non-Python tools:
+- `scrot`
+- `xdotool`
+- `curl`
+- Playwright Firefox runtime (`playwright install firefox`)
+
+`mantis.py` attempts auto-setup for some of these on boot, but manual install may still be needed depending on permissions/environment.
 
 ## Configuration
 
-Configuration is loaded from environment variables (`.env` supported via `python-dotenv`).
-
-Default values in code:
+Environment variables are loaded from `.env` via `python-dotenv`.
 
 | Variable | Default | Description |
 |---|---|---|
-| `LLM_BASE` | `http://localhost:8001/v1` | Base URL for chat completion API |
-| `MODEL` | `Qwen2.5-14B-Instruct-Q4_K_M.gguf` | Model identifier sent in request payload |
-| `MEMORY_DIR` | `.agent/memory` | ChromaDB and SQLite storage directory |
-| `SOUL_PATH` | `SOUL.md` | System prompt file path |
-| `TOP_K` | `4` | Retrieval depth per store |
-| `MAX_TOKENS` | `512` | `max_tokens` for completion call |
-| `EMBEDDING_BACKEND` | `hash` | `hash` or `sentence-transformers` |
-| `AUTONOMOUS_INTERVAL_SEC` | `300` | Period for autonomous prompts |
-| `WATCH_PATH` | `.` | Root path for filesystem watcher |
+| `LLM_BASE` | `http://localhost:8001/v1` | Base URL for model API |
+| `MODEL` | `Qwen2.5-14B-Instruct-Q4_K_M.gguf` | Model sent to API |
+| `MEMORY_DIR` | `.agent/memory` | Chroma + SQLite storage path |
+| `SOUL_PATH` | `SOUL.md` | Soul prompt file |
+| `TOP_K` | `4` | Retrieval depth |
+| `MAX_TOKENS` | `512` | Completion max tokens |
+| `MAX_LLM_TIMEOUT` | `120` | LLM request timeout (seconds) |
+| `EMBEDDING_BACKEND` | `hash` | `hash`, `llm`, or `sentence-transformers` |
+| `AUTONOMOUS_INTERVAL_SEC` | `300` | Autonomous heartbeat interval |
+| `WATCH_PATH` | `.` | Filesystem watcher root |
+| `MAX_HISTORY` | `10` | Recent chat messages kept in context |
+| `SHELL_LOG` | `.agent/shell.log` | Shared shell journal path |
 
-### Embedding Backend Notes
+## Soul file note
 
-- `hash` backend is dependency-free and deterministic.
-- `sentence-transformers` backend is supported in code but requires installing `sentence-transformers` separately (not included in `requirements.txt`).
+Repo file is `soul.md` (lowercase), while default config uses `SOUL.md`.
+On case-sensitive filesystems, either:
+- set `SOUL_PATH=soul.md`, or
+- rename file to `SOUL.md`.
 
-## Execution Characteristics and Limits
+## Repository layout
 
-- Tool command execution uses `subprocess.run(..., shell=True, timeout=30)`.
-- File writes can target arbitrary paths accessible to the process.
-- No authentication, sandboxing, or policy engine is implemented inside `mantis.py`.
-- Error handling for the LLM call is minimal (`raise_for_status()` then parse JSON).
+- `mantis.py` — runtime
+- `soul.md` — soul prompt/instructions
+- `requirements.txt` — Python dependencies
+- `docs/assets/` — logo/startup art
 
-These properties make the current runtime suitable for controlled local environments, not untrusted multi-tenant deployment.
+## Security and limits
 
-## Repository Layout
+This runtime is intentionally permissive:
+- shell commands run as current OS user
+- file writes are unconstrained within process permissions
+- external network calls are allowed by tool directives
+- no built-in policy engine or sandbox inside `mantis.py`
 
-- `mantis.py`: main runtime
-- `requirements.txt`: Python dependencies
-- `docs/assets/`: static assets (logo, startup banner module)
-- `soul.md`: example prompt text file in this repo (note: default lookup path in code is `SOUL.md` unless overridden)
-
-## Scientific Writing and Evaluation Guidance
-
-If this project is used for scientific workflows, treat the runtime as an experimental system. Recommended practice:
-- state the exact commit hash and environment variables used in experiments
-- fix model version and endpoint implementation for reproducibility
-- log all tool invocations and side effects as part of experimental records
-- report known threats to validity (prompt drift, retrieval noise, nondeterministic model outputs)
-- separate exploratory qualitative findings from quantitative claims
+Use in controlled environments.
 
 ## Inspiration
 

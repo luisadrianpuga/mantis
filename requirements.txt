@@ -3,3 +3,4 @@ chromadb
 python-dotenv
 watchdog
 pexpect
+discord.py
