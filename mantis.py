@@ -61,6 +61,7 @@ WATCH_PATH = os.getenv("WATCH_PATH", ".")
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "10"))
 SHELL_LOG = Path(os.getenv("SHELL_LOG", ".agent/shell.log"))
 MAX_LLM_TIMEOUT = int(os.getenv("MAX_LLM_TIMEOUT", "120"))
+MAX_AUTO_REPAIR_ATTEMPTS = int(os.getenv("MAX_AUTO_REPAIR_ATTEMPTS", "1"))
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 DISCORD_CHANNEL_ID = _env_int("DISCORD_CHANNEL_ID", 0)
 DISCORD_ACTIVITY_FEED = _env_bool("DISCORD_ACTIVITY_FEED", True)
@@ -1070,6 +1071,79 @@ def _command_preview(cmd: str, limit: int = 120) -> str:
     return f"{compact[:limit]}..."
 
 
+def _should_attempt_command_repair(cmd: str, result: str, outcome: str) -> bool:
+    if outcome not in {"fail", "timeout"}:
+        return False
+    if not cmd.strip() or len(cmd) > 5000:
+        return False
+    lower = (result or "").lower()
+    markers = (
+        "syntax error",
+        "unexpected token",
+        "unterminated",
+        "parse error",
+        "awk:",
+        "sed:",
+        "bash:",
+    )
+    return any(m in lower for m in markers)
+
+
+def _repair_command_once(
+    broken_cmd: str,
+    error_output: str,
+    user_input: str,
+    memory: list[str],
+) -> str | None:
+    memory_block = "\n".join(f"- {m}" for m in memory[:6]) or "(none)"
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You repair broken shell commands.\n"
+                "Return exactly one tool line in this format:\n"
+                "COMMAND: <fixed command>\n"
+                "Rules:\n"
+                "- Keep the user's intent identical.\n"
+                "- Prefer portable bash/awk syntax.\n"
+                "- Output only one complete runnable command.\n"
+                "- No markdown fences, no explanations."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"User intent: {user_input}\n\n"
+                f"Recent memory:\n{memory_block}\n\n"
+                f"Broken command:\n{broken_cmd}\n\n"
+                f"Error output:\n{error_output[:800]}"
+            ),
+        },
+    ]
+    try:
+        r = httpx.post(
+            f"{LLM_BASE}/chat/completions",
+            json={"model": MODEL, "messages": messages, "max_tokens": 220},
+            timeout=min(MAX_LLM_TIMEOUT, 45),
+        )
+        r.raise_for_status()
+        content = r.json()["choices"][0]["message"]["content"].strip()
+    except Exception:
+        return None
+
+    repaired = parse_command(content) or parse_command_fallback(content)
+    if not repaired:
+        return None
+    repaired = _normalize_command(repaired)
+    if "\n" in repaired:
+        repaired = _flatten_command(repaired)
+    if repaired == broken_cmd:
+        return None
+    if _is_incomplete_command(repaired) or not _is_safe_command(repaired):
+        return None
+    return repaired
+
+
 def parse_read(reply: str) -> str | None:
     m = re.search(r"READ:\s*(.+)", reply)
     return m.group(1).strip() if m else None
@@ -1718,7 +1792,7 @@ def act(context: dict) -> str:
                 duration_ms = int((time.time() - started) * 1000)
                 ui_print(f"  {result[:200]}\n")
                 _log_to_shell_journal(cmd, result, actor="mantis")
-                _record_outcome_and_learn(
+                outcome = _record_outcome_and_learn(
                     cmd,
                     result,
                     source,
@@ -1726,6 +1800,44 @@ def act(context: dict) -> str:
                 )
                 attend(f"command result for `{cmd[:80]}`:\n{result}", source="tool")
                 discord_event("done", f"`{preview}` done ({elapsed}s)\n{result[:300]}")
+
+                repaired_result = None
+                if MAX_AUTO_REPAIR_ATTEMPTS > 0 and _should_attempt_command_repair(
+                    cmd, result, outcome
+                ):
+                    repaired_cmd = _repair_command_once(
+                        cmd,
+                        result,
+                        context["input"],
+                        context.get("memory", []),
+                    )
+                    if repaired_cmd:
+                        repaired_preview = _command_preview(repaired_cmd, 120)
+                        ui_print(f"\n  [auto-repair retry: {repaired_preview}]")
+                        discord_event(
+                            "warn",
+                            f"auto-repair retry for `{preview}` -> `{repaired_preview}`",
+                        )
+                        retry_start = time.time()
+                        repaired_result = run_script(repaired_cmd, timeout=30)
+                        retry_elapsed = round(time.time() - retry_start, 1)
+                        retry_duration_ms = int((time.time() - retry_start) * 1000)
+                        ui_print(f"  {repaired_result[:200]}\n")
+                        _log_to_shell_journal(repaired_cmd, repaired_result, actor="mantis")
+                        _record_outcome_and_learn(
+                            repaired_cmd,
+                            repaired_result,
+                            source,
+                            duration_ms=retry_duration_ms,
+                        )
+                        attend(
+                            f"command retry result for `{repaired_cmd[:80]}`:\n{repaired_result}",
+                            source="tool",
+                        )
+                        discord_event(
+                            "done",
+                            f"`{repaired_preview}` done ({retry_elapsed}s)\n{repaired_result[:300]}",
+                        )
                 reply = "(ran command)"
 
     read_path = parse_read(reply)
