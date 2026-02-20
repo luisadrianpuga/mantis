@@ -828,9 +828,9 @@ HEARTBEAT_PROMPTS = [
     # Unfinished work
     "What has the user asked you to do that isn't finished yet? Be specific and surface it.",
     # Hardware awareness
-    "Check system health. COMMAND: now && cat /proc/loadavg && free -h",
+    "Check system health. Run the now command and report what you find.",
     # Todo check
-    "Is there a todo list? If so read it and remind the user of anything incomplete. READ: todo_list.txt",
+    "Is there a todo list? If so, read todo_list.txt and remind the user of anything incomplete.",
     # Memory synthesis
     "Review recent memory. What's the single most important thing the user is working on right now?",
     # Open question
