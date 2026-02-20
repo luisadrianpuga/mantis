@@ -19,7 +19,7 @@ import time
 import urllib.parse
 import uuid
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from queue import Empty, Queue
 import chromadb
@@ -60,6 +60,7 @@ DISCORD_CHANNEL_ID = _env_int("DISCORD_CHANNEL_ID", 0)
 DB_PATH = MEMORY_DIR / "fts.db"
 MEMORY_MD = Path(".agent/MEMORY.md")
 SKILLS_DIR = Path(".agent/skills")
+TASKS_PATH = Path("tasks.md")
 EMBED_DIM = 384
 
 print(START_UP_LOGO)
@@ -158,6 +159,38 @@ def _ensure_playwright_firefox() -> None:
 
 
 _ensure_playwright_firefox()
+
+
+def _ensure_tasks_file() -> None:
+    """Create a default tasks.md file on first boot."""
+    if TASKS_PATH.exists():
+        return
+    default = """# Mantis Tasks
+
+- name: morning briefing
+  schedule: daily 8am
+  prompt: Run the now command, check todo_list.txt if it exists, and give a brief morning summary.
+
+- name: news digest
+  schedule: daily 9am
+  prompt: Fetch top headlines by running: curl -sL https://feeds.apnews.com/rss/apf-topnews | grep -oP '(?<=<title>)[^<]+' | head -6
+
+- name: disk check
+  schedule: daily 11pm
+  prompt: Check disk usage with df -h. If any partition is over 80% full, alert the user clearly.
+
+- name: soul review
+  schedule: weekly sunday 10am
+  prompt: Review this week's memory. What did you learn about the user's preferences, working style, or goals? Propose 1-3 short additions to SOUL.md as a numbered list. Do not write anything yet - wait for the user to say 'approve soul'.
+"""
+    try:
+        TASKS_PATH.write_text(default, encoding="utf-8")
+        print("[tasks] created default tasks.md")
+    except Exception as e:
+        print(f"[tasks] could not create tasks.md: {e}")
+
+
+_ensure_tasks_file()
 db = chromadb.PersistentClient(str(MEMORY_DIR))
 collection = db.get_or_create_collection("events")
 
@@ -274,6 +307,92 @@ def md_tail(n: int = 6) -> list[str]:
     return [l.strip("- ").strip() for l in lines[-n:] if l.strip()]
 
 
+def load_tasks() -> list[dict]:
+    """Parse tasks.md into a list of task dicts."""
+    if not TASKS_PATH.exists():
+        return []
+    try:
+        text = TASKS_PATH.read_text(encoding="utf-8")
+    except Exception:
+        return []
+
+    tasks = []
+    current: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("- name:"):
+            if current.get("name") and current.get("schedule") and current.get("prompt"):
+                tasks.append(current)
+            current = {"name": line[7:].strip()}
+        elif line.startswith("schedule:"):
+            current["schedule"] = line[9:].strip()
+        elif line.startswith("prompt:"):
+            current["prompt"] = line[7:].strip()
+        elif current.get("prompt") and line and not line.startswith("-"):
+            current["prompt"] += f" {line}"
+    if current.get("name") and current.get("schedule") and current.get("prompt"):
+        tasks.append(current)
+    return tasks
+
+
+def _next_fire(schedule: str, now: datetime) -> datetime | None:
+    """Parse natural language schedule and return next fire datetime."""
+    s = schedule.lower().strip()
+
+    # daily HH:MM or daily Xam/pm
+    m = re.search(r"daily\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", s)
+    if m:
+        hour = int(m.group(1))
+        minute = int(m.group(2) or 0)
+        meridiem = m.group(3)
+        if meridiem == "pm" and hour != 12:
+            hour += 12
+        elif meridiem == "am" and hour == 12:
+            hour = 0
+        candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if candidate <= now:
+            candidate += timedelta(days=1)
+        return candidate
+
+    # weekly <weekday> HH:MM or Xam/pm
+    days = {
+        "monday": 0,
+        "tuesday": 1,
+        "wednesday": 2,
+        "thursday": 3,
+        "friday": 4,
+        "saturday": 5,
+        "sunday": 6,
+    }
+    for day_name, day_num in days.items():
+        if day_name in s:
+            m = re.search(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", s)
+            if not m:
+                return None
+            hour = int(m.group(1))
+            minute = int(m.group(2) or 0)
+            meridiem = m.group(3)
+            if meridiem == "pm" and hour != 12:
+                hour += 12
+            elif meridiem == "am" and hour == 12:
+                hour = 0
+
+            days_ahead = (day_num - now.weekday()) % 7
+            if days_ahead == 0:
+                candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                if candidate > now:
+                    return candidate
+                days_ahead = 7
+            candidate = (now + timedelta(days=days_ahead)).replace(
+                hour=hour,
+                minute=minute,
+                second=0,
+                microsecond=0,
+            )
+            return candidate
+    return None
+
+
 # -- Conversation history -----------------------------------------------------
 _chat_history: list[dict] = []
 _history_lock = threading.Lock()
@@ -335,6 +454,8 @@ _discord_client = None
 _discord_loop = None
 _discord_ready = threading.Event()
 _discord_channel = None
+_task_fire_times: dict[str, datetime] = {}
+_task_lock = threading.Lock()
 _META_REPLIES = {
     "(running...)",
     "(ran command)",
@@ -399,6 +520,14 @@ def _start_discord() -> None:
         if message.channel.id != DISCORD_CHANNEL_ID:
             return
         if not message.content:
+            return
+        if message.content.lower().startswith("approve soul"):
+            attend(
+                "The user approved the soul update proposal. "
+                "Write the approved additions to SOUL.md now using WRITE:. "
+                "Append to the existing content, do not replace it.",
+                source="discord",
+            )
             return
         attend(message.content, source="discord")
 
@@ -932,6 +1061,32 @@ def autonomous_loop():
         attend(next_heartbeat_prompt(), source="autonomous")
 
 
+def task_scheduler_loop():
+    """Check tasks.md periodically and fire due tasks as autonomous events."""
+    while not _event_loop_stop.is_set():
+        _event_loop_stop.wait(60)
+        if _event_loop_stop.is_set():
+            break
+        try:
+            now = datetime.utcnow()
+            tasks = load_tasks()
+            for task in tasks:
+                name = task["name"]
+                with _task_lock:
+                    next_fire = _task_fire_times.get(name)
+                    if next_fire is None:
+                        next_fire = _next_fire(task["schedule"], now)
+                        if next_fire:
+                            _task_fire_times[name] = next_fire
+                        continue
+                    if now >= next_fire:
+                        ui_print(f"\n[tasks] firing: {name}\n")
+                        attend(task["prompt"], source="autonomous")
+                        _task_fire_times[name] = _next_fire(task["schedule"], now)
+        except Exception as e:
+            ui_print(f"[tasks] error: {e}")
+
+
 # -- Filesystem watcher -------------------------------------------------------
 def _should_ignore_fs_path(path: str) -> bool:
     normalized = path.replace("\\", "/")
@@ -996,6 +1151,12 @@ def start_watcher():
                             attend(f"you ran in terminal: {last}", source="shell_journal")
                 except Exception:
                     pass
+                return
+
+            if Path(path).name == "tasks.md" and event_type in {"created", "modified"}:
+                with _task_lock:
+                    _task_fire_times.clear()
+                ui_print("[tasks] reloaded tasks.md")
                 return
 
             normalized = path.replace("\\", "/")
@@ -1299,6 +1460,7 @@ def input_loop():
 def main():
     threading.Thread(target=event_loop, daemon=True).start()
     threading.Thread(target=autonomous_loop, daemon=True).start()
+    threading.Thread(target=task_scheduler_loop, daemon=True).start()
     threading.Thread(target=start_watcher, daemon=True).start()
     threading.Thread(target=input_loop, daemon=True).start()
     threading.Thread(target=_start_discord, daemon=True).start()
