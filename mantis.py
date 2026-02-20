@@ -432,7 +432,6 @@ ASYNC_COMMAND_PREFIXES = [
     "wget",
     "curl",
     "git clone",
-    "now",
 ]
 
 INTERACTIVE_COMMANDS = [
