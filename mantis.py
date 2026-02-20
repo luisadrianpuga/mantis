@@ -334,6 +334,7 @@ _input_waiting = threading.Event()
 _discord_client = None
 _discord_loop = None
 _discord_ready = threading.Event()
+_discord_channel = None
 
 
 def ui_print(message: str = "", redraw_prompt: bool = True) -> None:
@@ -348,7 +349,7 @@ def ui_print(message: str = "", redraw_prompt: bool = True) -> None:
 
 def _start_discord() -> None:
     """Start Discord client and route channel messages into the event bus."""
-    global _discord_client, _discord_loop
+    global _discord_client, _discord_loop, _discord_channel
 
     if not DISCORD_TOKEN or DISCORD_CHANNEL_ID <= 0:
         return
@@ -367,9 +368,15 @@ def _start_discord() -> None:
 
     @client.event
     async def on_ready():
-        global _discord_client, _discord_loop
+        global _discord_client, _discord_loop, _discord_channel
         _discord_client = client
         _discord_loop = asyncio.get_running_loop()
+        _discord_channel = client.get_channel(DISCORD_CHANNEL_ID)
+        if _discord_channel is None:
+            try:
+                _discord_channel = await client.fetch_channel(DISCORD_CHANNEL_ID)
+            except Exception:
+                _discord_channel = None
         _discord_ready.set()
         ui_print(f"[discord] connected as {client.user}")
 
@@ -399,16 +406,29 @@ def discord_post(message: str) -> None:
     import asyncio
 
     async def _send():
-        channel = _discord_client.get_channel(DISCORD_CHANNEL_ID)
+        global _discord_channel
+        channel = _discord_channel or _discord_client.get_channel(DISCORD_CHANNEL_ID)
+        if channel is None:
+            try:
+                channel = await _discord_client.fetch_channel(DISCORD_CHANNEL_ID)
+                _discord_channel = channel
+            except Exception as e:
+                ui_print(f"[discord] send failed (channel): {e}")
+                return
         if channel is None:
             return
         for i in range(0, len(message), 1900):
-            await channel.send(message[i : i + 1900])
+            try:
+                await channel.send(message[i : i + 1900])
+            except Exception as e:
+                ui_print(f"[discord] send failed: {e}")
+                return
 
     try:
-        asyncio.run_coroutine_threadsafe(_send(), _discord_loop)
-    except Exception:
-        pass
+        fut = asyncio.run_coroutine_threadsafe(_send(), _discord_loop)
+        fut.add_done_callback(lambda f: f.exception())
+    except Exception as e:
+        ui_print(f"[discord] scheduling failed: {e}")
 
 
 # -- Soul ---------------------------------------------------------------------
@@ -1023,7 +1043,7 @@ def process_events_once() -> None:
                 ui_print(f"\n[mantis]: {reply}\n")
             elif source not in {"agent_echo", "tool"}:
                 ui_print(f"\nagent: {reply}\n")
-            if source in {"discord", "autonomous"}:
+            if source in {"discord", "autonomous", "shell", "shell_journal", "search", "skill"}:
                 discord_post(reply)
 
 
