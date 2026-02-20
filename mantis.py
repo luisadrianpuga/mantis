@@ -14,6 +14,7 @@ import shlex
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -24,7 +25,6 @@ from pathlib import Path
 from queue import Empty, Queue
 import chromadb
 import httpx
-import pexpect
 from dotenv import load_dotenv
 from docs.assets.start_up_logo import start_up_logo as START_UP_LOGO
 
@@ -580,14 +580,6 @@ def load_soul() -> str:
 
 
 # -- Tools --------------------------------------------------------------------
-_shell: pexpect.spawn | None = None
-_shell_lock = threading.Lock()
-_shell_io_lock = threading.Lock()
-_async_shell: pexpect.spawn | None = None
-_async_shell_lock = threading.Lock()
-_async_shell_io_lock = threading.Lock()
-_SHELL_PROMPT = "__MANTIS_DONE__"
-
 ASYNC_COMMAND_PREFIXES = [
     "pip install",
     "playwright install",
@@ -638,121 +630,64 @@ def _is_shell_log_path(path: str) -> bool:
         return path.replace("\\", "/").endswith("shell.log")
 
 
-def _reset_shell() -> None:
-    global _shell
-    with _shell_lock:
-        if _shell is not None:
-            try:
-                _shell.terminate(force=True)
-            except Exception:
-                pass
-        _shell = None
-
-
-def _reset_async_shell() -> None:
-    global _async_shell
-    with _async_shell_lock:
-        if _async_shell is not None:
-            try:
-                _async_shell.terminate(force=True)
-            except Exception:
-                pass
-        _async_shell = None
-
-
-def _get_shell() -> pexpect.spawn:
-    global _shell
-    with _shell_lock:
-        if _shell is None or not _shell.isalive():
-            shell = pexpect.spawn(
-                "/bin/bash",
-                encoding="utf-8",
-                timeout=None,
-            )
-            shell.sendline("export TERM=dumb")
-            shell.sendline(f'export PS1="{_SHELL_PROMPT} "')
-            shell.expect(_SHELL_PROMPT, timeout=5)
-            _shell = shell
-        return _shell
-
-
-def _get_async_shell() -> pexpect.spawn:
-    global _async_shell
-    with _async_shell_lock:
-        if _async_shell is None or not _async_shell.isalive():
-            shell = pexpect.spawn(
-                "/bin/bash",
-                encoding="utf-8",
-                timeout=None,
-            )
-            shell.sendline("export TERM=dumb")
-            shell.sendline(f'export PS1="{_SHELL_PROMPT} "')
-            shell.expect(_SHELL_PROMPT, timeout=5)
-            _async_shell = shell
-        return _async_shell
-
-
-def _shell_output(output: str, cmd: str) -> str:
-    lines = output.splitlines()
-    if lines and lines[0].strip() == cmd.strip():
-        lines = lines[1:]
-    cleaned = "\n".join(lines).strip()
+def _strip_ansi(text: str) -> str:
+    cleaned = text
     cleaned = re.sub(r"\x1b\[[0-9;]*[mGKHF]", "", cleaned)
     cleaned = re.sub(r"\x1b\][^\x07]*\x07", "", cleaned)
-    cleaned = cleaned.strip()
-    return cleaned or "(no output)"
+    return cleaned.strip()
 
 
-def _run_shell_command(cmd: str, timeout: int) -> str:
-    with _shell_io_lock:
-        shell = _get_shell()
-        shell.sendline(cmd)
-        shell.expect(_SHELL_PROMPT, timeout=timeout)
-        return _shell_output(shell.before.strip(), cmd)
+def run_script(cmd: str, timeout: int = 30) -> str:
+    """
+    Write command text to a temp bash script and execute it atomically.
+    Handles multi-line commands, subshells, awk, heredocs, and pipelines.
+    """
+    script_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".sh",
+            delete=False,
+            dir="/tmp",
+            prefix="mantis_",
+        ) as f:
+            f.write("#!/bin/bash\n")
+            f.write("set -o pipefail\n")
+            f.write(cmd)
+            if not cmd.endswith("\n"):
+                f.write("\n")
+            script_path = f.name
+
+        result = subprocess.run(
+            ["bash", script_path],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        output = (result.stdout + result.stderr).strip()
+        output = _strip_ansi(output)
+        return output or "(no output)"
+    except subprocess.TimeoutExpired:
+        return f"(timed out after {timeout}s)"
+    except Exception as e:
+        return f"(script error: {e})"
+    finally:
+        if script_path:
+            try:
+                Path(script_path).unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
-def run_command_async(cmd: str) -> None:
-    """Run a command in the persistent shell and feed result back as events."""
+def run_script_async(cmd: str) -> None:
+    """Run script asynchronously and feed result back as a shell event."""
 
     def _run():
-        try:
-            with _async_shell_io_lock:
-                shell = _get_async_shell()
-                shell.sendline(cmd)
-                shell.expect(_SHELL_PROMPT, timeout=60)
-                result = _shell_output(shell.before.strip(), cmd)
-            _log_to_shell_journal(cmd, result, actor="mantis")
-            attend(f"shell result for `{cmd}`:\n{result}", source="shell")
-        except pexpect.TIMEOUT:
-            _reset_async_shell()
-            result = "timed out after 60s"
-            _log_to_shell_journal(cmd, result, actor="mantis")
-            attend(f"shell result for `{cmd}`: {result}", source="shell")
-        except Exception as e:
-            _reset_async_shell()
-            result = f"error — {e}"
-            _log_to_shell_journal(cmd, result, actor="mantis")
-            attend(f"shell result for `{cmd}`: {result}", source="shell")
+        result = run_script(cmd, timeout=60)
+        _log_to_shell_journal(cmd, result, actor="mantis")
+        attend(f"shell result for `{cmd[:80]}`:\n{result}", source="shell")
 
     threading.Thread(target=_run, daemon=True).start()
-
-
-def run_command(cmd: str) -> str:
-    """Synchronous command execution over the persistent shell."""
-    try:
-        result = _run_shell_command(cmd, timeout=30)
-        _log_to_shell_journal(cmd, result, actor="mantis")
-        return result
-    except pexpect.TIMEOUT:
-        _reset_shell()
-        result = "(timed out after 30s; shell session reset)"
-        _log_to_shell_journal(cmd, result, actor="mantis")
-        return result
-    except Exception as e:
-        _reset_shell()
-        result = f"(error: {e})"
-        _log_to_shell_journal(cmd, result, actor="mantis")
-        return result
 
 
 def read_file(path: str) -> str:
@@ -775,7 +710,7 @@ def write_file(path: str, content: str) -> str:
 def parse_command(reply: str) -> str | None:
     tool_markers = "READ|WRITE|SCREENSHOT|CLICK|TYPE|SEARCH|FETCH|SKILL"
     m = re.search(
-        rf"COMMAND:\s*(.+?)(?=\n(?:{tool_markers}):|\Z)",
+        rf"COMMAND:\s*\n?(.*?)(?=\n(?:{tool_markers}):|\Z)",
         reply,
         re.DOTALL,
     )
@@ -807,23 +742,15 @@ def parse_command_fallback(reply: str) -> str | None:
 
 
 def _is_safe_command(cmd: str) -> bool:
-    """Reject commands likely to hang waiting for more shell input."""
+    """Basic safety check for script execution."""
     compact = cmd.strip()
-    if len(compact) < 4:
+    if len(compact) < 2:
         return False
     if not re.search(r"[A-Za-z0-9]", compact):
         return False
-    if compact in {"(", ")", "{", "}", "[", "]"}:
+    if ":(){ :|:& };:" in compact:
         return False
-    if cmd.count("'") % 2 != 0:
-        return False
-    if cmd.count('"') % 2 != 0:
-        return False
-    if cmd.rstrip().endswith("\\"):
-        return False
-    try:
-        shlex.split(compact)
-    except ValueError:
+    if re.search(r"(^|[;\s])rm\s+-rf\s+/\s*($|[;\s])", compact):
         return False
     return True
 
@@ -1392,12 +1319,9 @@ def act(context: dict) -> str:
     if cmd:
         if not _is_safe_command(cmd):
             ui_print(f"\n  [skipped unsafe command: {cmd[:60]}...]\n")
-            attend(
-                f"command skipped (unclosed quote or continuation): {cmd[:100]}",
-                source="tool",
-            )
+            attend("command skipped: failed safety check", source="tool")
             cmd = None
-            reply = "(skipped unsafe command)"
+            reply = "(skipped)"
     if cmd:
         stripped = cmd.strip().lower()
         base = stripped.split()[0] if stripped else ""
@@ -1419,16 +1343,19 @@ def act(context: dict) -> str:
             pass
         else:
             normalized = cmd.strip().lower()
-            is_long = any(normalized.startswith(prefix) for prefix in ASYNC_COMMAND_PREFIXES)
+            is_long = ("\n" in cmd) or any(
+                normalized.startswith(prefix) for prefix in ASYNC_COMMAND_PREFIXES
+            )
             if is_long:
-                ui_print(f"\n  [running async: {cmd}]")
-                run_command_async(cmd)
+                ui_print(f"\n  [running async script: {cmd[:60].strip()}...]\n")
+                run_script_async(cmd)
                 reply = "(running...)"
             else:
-                ui_print(f"\n  [running: {cmd}]")
-                result = run_command(cmd)
-                ui_print(f"  {result}\n")
-                attend(f"command result for `{cmd}`:\n{result}", source="tool")
+                ui_print(f"\n  [running: {cmd[:60]}]")
+                result = run_script(cmd, timeout=30)
+                ui_print(f"  {result[:200]}\n")
+                _log_to_shell_journal(cmd, result, actor="mantis")
+                attend(f"command result for `{cmd[:80]}`:\n{result}", source="tool")
                 reply = "(ran command)"
 
     read_path = parse_read(reply)
