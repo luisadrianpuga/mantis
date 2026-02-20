@@ -335,6 +335,18 @@ _discord_client = None
 _discord_loop = None
 _discord_ready = threading.Event()
 _discord_channel = None
+_META_REPLIES = {
+    "(running...)",
+    "(ran command)",
+    "(read file)",
+    "(searched)",
+    "(fetched)",
+    "(loaded skill)",
+    "(clicked)",
+    "(typed)",
+    "(took screenshot)",
+    "(wrote file)",
+}
 
 
 def ui_print(message: str = "", redraw_prompt: bool = True) -> None:
@@ -866,7 +878,7 @@ HEARTBEAT_PROMPTS = [
     # Unfinished work
     "What has the user asked you to do that isn't finished yet? Be specific and surface it.",
     # Hardware awareness
-    "Check system health by running the now command, then report what you find.",
+    "Check system health by running: now && cat /proc/loadavg && free -h",
     # Todo check
     "Is there a todo list? If so, read todo_list.txt and remind the user of anything incomplete.",
     # Memory synthesis
@@ -1044,7 +1056,8 @@ def process_events_once() -> None:
             elif source not in {"agent_echo", "tool"}:
                 ui_print(f"\nagent: {reply}\n")
             if source in {"discord", "autonomous", "shell", "shell_journal", "search", "skill"}:
-                discord_post(reply)
+                if reply not in _META_REPLIES:
+                    discord_post(reply)
 
 
 def event_loop():
