@@ -1156,21 +1156,13 @@ def act(context: dict) -> str:
             if is_long:
                 ui_print(f"\n  [running async: {cmd}]")
                 run_command_async(cmd)
+                reply = "(running...)"
             else:
                 ui_print(f"\n  [running: {cmd}]")
                 result = run_command(cmd)
                 ui_print(f"  {result}\n")
                 attend(f"command result for `{cmd}`:\n{result}", source="tool")
-            if cmd_from_fallback:
-                reply = re.sub(
-                    r"```(?:bash|sh|shell)?\s*\n.+?\n```",
-                    "",
-                    reply,
-                    count=1,
-                    flags=re.DOTALL | re.IGNORECASE,
-                ).strip() or "(ran command)"
-            else:
-                reply = reply[: reply.index("COMMAND:")].strip() or "(ran command)"
+                reply = "(ran command)"
 
     read_path = parse_read(reply)
     if read_path:
