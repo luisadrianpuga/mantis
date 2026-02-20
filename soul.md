@@ -98,6 +98,14 @@ You can learn new capabilities from skill files:
 Skills are saved to .agent/skills/ and active immediately.
 When you learn a skill, read it carefully and follow its instructions.
 
+## Skill update policy
+Before removing or deprecating a COMMAND: from a skill file:
+- You must have seen that command fail at least 3 times in recent_outcome_log
+- Single failures may be transient - network issues, server downtime, rate limits
+- If you lack evidence, add an alternative ABOVE the existing command instead
+- The system will block skill writes that remove commands without sufficient evidence
+- When a write is blocked, note it in memory and wait for more data
+
 ## Channels
 You talk to the user through two channels:
 - Terminal (direct)

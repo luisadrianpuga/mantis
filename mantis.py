@@ -62,6 +62,10 @@ MAX_HISTORY = int(os.getenv("MAX_HISTORY", "10"))
 SHELL_LOG = Path(os.getenv("SHELL_LOG", ".agent/shell.log"))
 MAX_LLM_TIMEOUT = int(os.getenv("MAX_LLM_TIMEOUT", "120"))
 MAX_AUTO_REPAIR_ATTEMPTS = int(os.getenv("MAX_AUTO_REPAIR_ATTEMPTS", "1"))
+MIN_FAILURES_BEFORE_SKILL_UPDATE = int(
+    os.getenv("MIN_FAILURES_BEFORE_SKILL_UPDATE", "3")
+)
+SKILL_UPDATE_WINDOW = int(os.getenv("SKILL_UPDATE_WINDOW", "50"))
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 DISCORD_CHANNEL_ID = _env_int("DISCORD_CHANNEL_ID", 0)
 DISCORD_ACTIVITY_FEED = _env_bool("DISCORD_ACTIVITY_FEED", True)
@@ -194,7 +198,15 @@ def _ensure_tasks_file() -> None:
 
 - name: learn review
   schedule: weekly sunday 11am
-  prompt: Review the last 50 command outcomes. Identify what commands worked, which failed or returned empty, and propose targeted updates to relevant skill files. Summarize your learning in one short line and store it in memory.
+  prompt: You are reviewing your own command execution history to improve your skills.
+    Step 1 - Run: COMMAND: echo "reviewing outcomes"
+    Step 2 - The system will show you recent_outcome_log in context. Analyze it.
+    Step 3 - For each skill that had failures or empty results, read the skill file.
+    Step 4 - Rewrite the skill file with WRITE: to fix the failing patterns.
+    Step 5 - Write one line to MEMORY.md summarizing what changed and why.
+    Focus on news.md first - it has the most execution history.
+    Only update skills where you have clear evidence of what works better.
+    Do not remove working commands. Add alternatives above failing ones.
 """
     try:
         TASKS_PATH.write_text(default, encoding="utf-8")
@@ -411,6 +423,96 @@ def recent_outcome_lines(limit: int = 12) -> str:
             f"- {row['ts']} [{row['outcome']}] ({row['source']}) {_command_preview(row['cmd'], 90)}"
         )
     return "\n".join(lines)
+
+
+def _cmd_failure_count(cmd: str, window: int = SKILL_UPDATE_WINDOW) -> int:
+    """
+    Count how many times a command failed/empty/timed out in recent outcomes.
+    Match on normalized first 200 chars to absorb minor whitespace variance.
+    """
+    key = " ".join((cmd or "").strip().split())[:200]
+    if not key:
+        return 0
+    rows = recent_command_outcomes(window)
+    count = 0
+    for row in rows:
+        row_key = " ".join((row.get("cmd") or "").strip().split())[:200]
+        if row_key == key and row.get("outcome") in {"fail", "empty", "timeout"}:
+            count += 1
+    return count
+
+
+def _skill_update_eligible(cmd: str) -> tuple[bool, str]:
+    """
+    A command must fail repeatedly before skill removals/deprecations are allowed.
+    Set MIN_FAILURES_BEFORE_SKILL_UPDATE=0 to disable this gate.
+    """
+    if MIN_FAILURES_BEFORE_SKILL_UPDATE <= 0:
+        return True, "gate disabled by config"
+    count = _cmd_failure_count(cmd, SKILL_UPDATE_WINDOW)
+    if count >= MIN_FAILURES_BEFORE_SKILL_UPDATE:
+        return True, f"confirmed: {count} failures in last {SKILL_UPDATE_WINDOW} outcomes"
+    return (
+        False,
+        "insufficient evidence: only "
+        f"{count} failure(s), need {MIN_FAILURES_BEFORE_SKILL_UPDATE}",
+    )
+
+
+def _is_skill_write(path: str) -> bool:
+    normalized = path.replace("\\", "/").lstrip("./")
+    return normalized.startswith(".agent/skills/") or "/skills/" in f"/{normalized}/"
+
+
+def _extract_deprecated_commands(old_content: str, new_content: str) -> list[str]:
+    """
+    Find COMMAND lines present in old content but removed from new content.
+    """
+    old_commands = [c.strip() for c in re.findall(r"COMMAND:\s*(.+)", old_content)]
+    new_commands = [c.strip() for c in re.findall(r"COMMAND:\s*(.+)", new_content)]
+    new_set = {" ".join(c.split())[:200] for c in new_commands if c}
+    removed = []
+    for cmd in old_commands:
+        key = " ".join(cmd.split())[:200]
+        if key and key not in new_set:
+            removed.append(cmd)
+    return removed
+
+
+def _guarded_skill_write(wpath: str, wcontent: str, reply: str) -> tuple[str, bool]:
+    """
+    Block skill writes that remove commands without enough failure evidence.
+    Returns (updated_reply, was_blocked).
+    """
+    existing = read_file(wpath)
+    if existing.startswith("(read error"):
+        return reply, False
+
+    removed_cmds = _extract_deprecated_commands(existing, wcontent)
+    if not removed_cmds:
+        return reply, False
+
+    blocked: list[tuple[str, str]] = []
+    for cmd in removed_cmds:
+        eligible, reason = _skill_update_eligible(cmd)
+        if not eligible:
+            blocked.append((cmd, reason))
+
+    if not blocked:
+        return reply, False
+
+    msg_parts = [f"`{_command_preview(c, 60)}`: {r}" for c, r in blocked]
+    block_msg = "; ".join(msg_parts)
+    ui_print(f"\n  [skill write blocked]\n  {block_msg}\n")
+    discord_event("warn", f"skill write blocked — {block_msg[:200]}")
+    attend(
+        f"skill write to {wpath} blocked. Insufficient failure evidence for: "
+        f"{block_msg}. Need {MIN_FAILURES_BEFORE_SKILL_UPDATE} failures each. "
+        "Add alternatives above existing commands instead of removing them.",
+        source="tool",
+    )
+    updated_reply = reply[: reply.index("WRITE:")].strip() or "(write blocked)"
+    return updated_reply, True
 
 
 # -- MEMORY.md ----------------------------------------------------------------
@@ -888,14 +990,19 @@ def _record_outcome_and_learn(
     attend(
         (
             f"command outcome [{outcome}] source={source} "
-            f"cmd={preview} result={result[:220]}"
+            f"skill={skill or '-'} cmd={preview} result={result[:220]}"
         ),
         source="learning",
     )
     return outcome
 
 
-def run_script_async(cmd: str, trigger_source: str = "tool") -> None:
+def run_script_async(
+    cmd: str,
+    trigger_source: str = "tool",
+    *,
+    skill: str = "",
+) -> None:
     """Run script asynchronously and feed result back as a shell event."""
 
     def _run():
@@ -910,6 +1017,7 @@ def run_script_async(cmd: str, trigger_source: str = "tool") -> None:
             result,
             trigger_source,
             duration_ms=duration_ms,
+            skill=skill,
         )
         attend(f"shell result for `{cmd[:80]}`:\n{result}", source="shell")
         if outcome in {"timeout", "fail"}:
@@ -1684,18 +1792,21 @@ def act(context: dict) -> str:
     soul = load_soul()
     skills_block = load_all_skills()
     memory_block = "\n".join(f"- {m}" for m in context["memory"]) or "(none yet)"
-    outcomes_block = outcome_digest(25)
-    recent_outcomes_block = recent_outcome_lines(12)
     source = context.get("source", "user")
+    active_skill: str = ""
 
     system = f"{soul}\n\n"
     if skills_block:
         system += f"---\n## Loaded Skills\n{skills_block}\n\n"
+    system += f"---\nRelevant memory:\n{memory_block}\n\n"
+    if source in {"autonomous", "learning", "shell", "skill"}:
+        outcomes_block = outcome_digest(25)
+        recent_outcomes_block = recent_outcome_lines(8)
+        system += (
+            f"Recent command outcomes:\n{outcomes_block}\n\n"
+            f"Recent outcome log:\n{recent_outcomes_block}\n\n"
+        )
     system += (
-        "---\n"
-        f"Relevant memory:\n{memory_block}\n\n"
-        f"Recent command outcomes:\n{outcomes_block}\n\n"
-        f"Recent outcome log:\n{recent_outcomes_block}\n\n"
         "---\n"
         "Tools - emit one or more per reply if needed:\n"
         "  COMMAND: <shell command>\n"
@@ -1780,7 +1891,7 @@ def act(context: dict) -> str:
                 preview = _command_preview(cmd, 120)
                 ui_print(f"\n  [running async script: {preview}]")
                 discord_event("run", f"`{preview}`")
-                run_script_async(cmd, trigger_source=source)
+                run_script_async(cmd, trigger_source=source, skill=active_skill)
                 reply = "(running...)"
             else:
                 preview = _command_preview(cmd, 120)
@@ -1797,6 +1908,7 @@ def act(context: dict) -> str:
                     result,
                     source,
                     duration_ms=duration_ms,
+                    skill=active_skill,
                 )
                 attend(f"command result for `{cmd[:80]}`:\n{result}", source="tool")
                 discord_event("done", f"`{preview}` done ({elapsed}s)\n{result[:300]}")
@@ -1829,6 +1941,7 @@ def act(context: dict) -> str:
                             repaired_result,
                             source,
                             duration_ms=retry_duration_ms,
+                            skill=active_skill,
                         )
                         attend(
                             f"command retry result for `{repaired_cmd[:80]}`:\n{repaired_result}",
@@ -1852,13 +1965,18 @@ def act(context: dict) -> str:
     write_result = parse_write(reply)
     if write_result:
         wpath, wcontent = write_result
-        ui_print(f"\n  [writing: {wpath}]")
-        discord_event("write", f"`{wpath}`")
-        result = write_file(wpath, wcontent)
-        ui_print(f"  {result}\n")
-        discord_event("done", result[:300])
-        attend(f"file write result: {result}", source="tool")
-        reply = reply[: reply.index("WRITE:")].strip() or "(wrote file)"
+        was_blocked = False
+        if _is_skill_write(wpath):
+            reply, was_blocked = _guarded_skill_write(wpath, wcontent, reply)
+
+        if not was_blocked:
+            ui_print(f"\n  [writing: {wpath}]")
+            discord_event("write", f"`{wpath}`")
+            result = write_file(wpath, wcontent)
+            ui_print(f"  {result}\n")
+            discord_event("done", result[:300])
+            attend(f"file write result: {result}", source="tool")
+            reply = reply[: reply.index("WRITE:")].strip() or "(wrote file)"
 
     screenshot_path = parse_screenshot(reply)
     if screenshot_path:
@@ -1918,6 +2036,7 @@ def act(context: dict) -> str:
         result = load_skill(skill_source)
         ui_print(f"  ({len(result)} chars)\n")
         skill_name = Path(skill_source).name if "://" not in skill_source else skill_source.split("/")[-1]
+        active_skill = Path(skill_name).stem
         discord_event("done", f"skill ready: {skill_name[:80]}")
         attend(f"skill loaded: {result}", source="skill")
         reply = reply[: reply.index("SKILL:")].strip() or "(loaded skill)"
