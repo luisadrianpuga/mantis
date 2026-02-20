@@ -763,6 +763,24 @@ def write_file(path: str, content: str) -> str:
         return f"(write error: {e})"
 
 
+def _flatten_command(cmd: str) -> str:
+    """
+    Convert multi-line command text into a single logical line.
+    This avoids partial execution when models emit formatted shell blocks.
+    """
+    lines = cmd.strip().splitlines()
+    if len(lines) <= 1:
+        return cmd.strip()
+
+    parts = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parts.append(stripped)
+    return " ".join(parts).strip()
+
+
 def parse_command(reply: str) -> str | None:
     tool_markers = "READ|WRITE|SCREENSHOT|CLICK|TYPE|SEARCH|FETCH|SKILL"
     m = re.search(
@@ -775,6 +793,8 @@ def parse_command(reply: str) -> str | None:
     cmd = m.group(1).strip()
     if not cmd:
         return None
+    if "\n" in cmd:
+        cmd = _flatten_command(cmd)
     if cmd == "(":
         return None
     return cmd
