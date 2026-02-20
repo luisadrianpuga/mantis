@@ -582,6 +582,25 @@ def parse_command(reply: str) -> str | None:
     return m.group(1).strip() if m else None
 
 
+def parse_command_fallback(reply: str) -> str | None:
+    """
+    Fallback parser: extract first fenced shell block when COMMAND: is missing.
+    """
+    m = re.search(r"```(?:bash|sh|shell)?\s*\n(.+?)\n```", reply, re.DOTALL | re.IGNORECASE)
+    if not m:
+        return None
+    block = m.group(1).strip()
+    if not block:
+        return None
+    lines = [line.strip() for line in block.splitlines() if line.strip()]
+    if not lines:
+        return None
+    first = lines[0]
+    if first.startswith("$"):
+        first = first[1:].strip()
+    return first or None
+
+
 def parse_read(reply: str) -> str | None:
     m = re.search(r"READ:\s*(.+)", reply)
     return m.group(1).strip() if m else None
@@ -1108,6 +1127,10 @@ def act(context: dict) -> str:
     reply = r.json()["choices"][0]["message"]["content"].strip()
 
     cmd = parse_command(reply)
+    cmd_from_fallback = False
+    if not cmd:
+        cmd = parse_command_fallback(reply)
+        cmd_from_fallback = cmd is not None
     if cmd:
         stripped = cmd.strip().lower()
         base = stripped.split()[0] if stripped else ""
@@ -1138,7 +1161,16 @@ def act(context: dict) -> str:
                 result = run_command(cmd)
                 ui_print(f"  {result}\n")
                 attend(f"command result for `{cmd}`:\n{result}", source="tool")
-            reply = reply[: reply.index("COMMAND:")].strip() or "(ran command)"
+            if cmd_from_fallback:
+                reply = re.sub(
+                    r"```(?:bash|sh|shell)?\s*\n.+?\n```",
+                    "",
+                    reply,
+                    count=1,
+                    flags=re.DOTALL | re.IGNORECASE,
+                ).strip() or "(ran command)"
+            else:
+                reply = reply[: reply.index("COMMAND:")].strip() or "(ran command)"
 
     read_path = parse_read(reply)
     if read_path:
