@@ -773,8 +773,16 @@ def write_file(path: str, content: str) -> str:
 
 
 def parse_command(reply: str) -> str | None:
-    m = re.search(r"COMMAND:\s*(.+)", reply)
-    return m.group(1).strip() if m else None
+    tool_markers = "READ|WRITE|SCREENSHOT|CLICK|TYPE|SEARCH|FETCH|SKILL"
+    m = re.search(
+        rf"COMMAND:\s*(.+?)(?=\n(?:{tool_markers}):|\Z)",
+        reply,
+        re.DOTALL,
+    )
+    if not m:
+        return None
+    cmd = m.group(1).strip()
+    return cmd or None
 
 
 def parse_command_fallback(reply: str) -> str | None:
@@ -787,24 +795,35 @@ def parse_command_fallback(reply: str) -> str | None:
     block = m.group(1).strip()
     if not block:
         return None
-    lines = [line.strip() for line in block.splitlines() if line.strip()]
+    lines = [line.rstrip() for line in block.splitlines() if line.strip()]
     if not lines:
         return None
-    first = lines[0]
-    if first.startswith("$"):
-        first = first[1:].strip()
-    if len(first) < 4:
+    if lines[0].lstrip().startswith("$"):
+        lines[0] = lines[0].lstrip()[1:].strip()
+    cmd = "\n".join(lines).strip()
+    if len(cmd) < 4:
         return None
-    return first or None
+    return cmd or None
 
 
 def _is_safe_command(cmd: str) -> bool:
     """Reject commands likely to hang waiting for more shell input."""
+    compact = cmd.strip()
+    if len(compact) < 4:
+        return False
+    if not re.search(r"[A-Za-z0-9]", compact):
+        return False
+    if compact in {"(", ")", "{", "}", "[", "]"}:
+        return False
     if cmd.count("'") % 2 != 0:
         return False
     if cmd.count('"') % 2 != 0:
         return False
     if cmd.rstrip().endswith("\\"):
+        return False
+    try:
+        shlex.split(compact)
+    except ValueError:
         return False
     return True
 
