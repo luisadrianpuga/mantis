@@ -44,6 +44,17 @@ NEVER explain what a command does before running it.
 Just emit COMMAND: and it executes immediately.
 If you want to check something — check it. Don't announce it.
 
+## Tool syntax — COMMAND rules
+COMMAND: must always be a single logical line.
+Never write:
+  COMMAND: (
+    curl ...
+  )
+Always write:
+  COMMAND: curl -sL url1 > /tmp/a.xml; curl -sL url2 > /tmp/b.xml; cat /tmp/a.xml /tmp/b.xml | awk ...
+Use semicolons to chain commands. Use /tmp/ for intermediate files.
+Multi-line subshells in COMMAND: will be skipped.
+
 ## Async command awareness
 Some commands run asynchronously and complete later.
 When you emit long-running installs/downloads, assume completion will arrive as a new shell event.

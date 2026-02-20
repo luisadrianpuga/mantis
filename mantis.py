@@ -42,6 +42,13 @@ def _env_int(name: str, default: int = 0) -> int:
         return default
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 LLM_BASE = os.getenv("LLM_BASE", "http://localhost:8001/v1")
 MODEL = os.getenv("MODEL", "Qwen2.5-14B-Instruct-Q4_K_M.gguf")
 MEMORY_DIR = Path(os.getenv("MEMORY_DIR", ".agent/memory"))
@@ -56,6 +63,7 @@ SHELL_LOG = Path(os.getenv("SHELL_LOG", ".agent/shell.log"))
 MAX_LLM_TIMEOUT = int(os.getenv("MAX_LLM_TIMEOUT", "120"))
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 DISCORD_CHANNEL_ID = _env_int("DISCORD_CHANNEL_ID", 0)
+DISCORD_ACTIVITY_FEED = _env_bool("DISCORD_ACTIVITY_FEED", True)
 
 DB_PATH = MEMORY_DIR / "fts.db"
 MEMORY_MD = Path(".agent/MEMORY.md")
@@ -468,6 +476,20 @@ _META_REPLIES = {
     "(took screenshot)",
     "(wrote file)",
 }
+_DISCORD_ICONS = {
+    "run": "⚡",
+    "done": "✅",
+    "error": "❌",
+    "read": "📋",
+    "write": "💾",
+    "search": "🔍",
+    "fetch": "🌐",
+    "skill": "🧠",
+    "task": "🕐",
+    "shell": "🖥️",
+    "info": "ℹ️",
+    "warn": "⚠️",
+}
 
 
 def ui_print(message: str = "", redraw_prompt: bool = True) -> None:
@@ -512,6 +534,7 @@ def _start_discord() -> None:
                 _discord_channel = None
         _discord_ready.set()
         ui_print(f"[discord] connected as {client.user}")
+        threading.Thread(target=_discord_boot_message, daemon=True).start()
 
     @client.event
     async def on_message(message):
@@ -570,6 +593,32 @@ def discord_post(message: str) -> None:
         fut.add_done_callback(lambda f: f.exception())
     except Exception as e:
         ui_print(f"[discord] scheduling failed: {e}")
+
+
+def discord_event(kind: str, message: str) -> None:
+    """Post a lightweight activity event to Discord."""
+    if not DISCORD_ACTIVITY_FEED or not message:
+        return
+    icon = _DISCORD_ICONS.get(kind, "•")
+    discord_post(f"{icon} {message}")
+
+
+def _discord_boot_message() -> None:
+    """Post a one-time status summary after Discord connects."""
+    if not _discord_ready.wait(timeout=10):
+        return
+    now_utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    tasks = load_tasks()
+    task_names = ", ".join(t.get("name", "") for t in tasks if t.get("name")) or "none"
+    skills = sorted(SKILLS_DIR.glob("*.md")) if SKILLS_DIR.exists() else []
+    skill_names = ", ".join(s.stem for s in skills) if skills else "none"
+    msg = (
+        f"🟢 **mantis online** - {now_utc}\n"
+        f"tasks: {task_names}\n"
+        f"skills: {skill_names}\n"
+        f"model: {MODEL}"
+    )
+    discord_post(msg)
 
 
 # -- Soul ---------------------------------------------------------------------
@@ -683,9 +732,16 @@ def run_script_async(cmd: str) -> None:
     """Run script asynchronously and feed result back as a shell event."""
 
     def _run():
+        started = time.time()
         result = run_script(cmd, timeout=60)
+        elapsed = round(time.time() - started, 1)
+        preview = _command_preview(cmd, 120)
         _log_to_shell_journal(cmd, result, actor="mantis")
         attend(f"shell result for `{cmd[:80]}`:\n{result}", source="shell")
+        if "timed out" in result.lower() or result.lower().startswith("(script error"):
+            discord_event("error", f"`{preview}` - {result[:140]}")
+        else:
+            discord_event("shell", f"`{preview}` done ({elapsed}s)\n{result[:300]}")
 
     threading.Thread(target=_run, daemon=True).start()
 
@@ -717,7 +773,11 @@ def parse_command(reply: str) -> str | None:
     if not m:
         return None
     cmd = m.group(1).strip()
-    return cmd or None
+    if not cmd:
+        return None
+    if cmd == "(":
+        return None
+    return cmd
 
 
 def parse_command_fallback(reply: str) -> str | None:
@@ -753,6 +813,45 @@ def _is_safe_command(cmd: str) -> bool:
     if re.search(r"(^|[;\s])rm\s+-rf\s+/\s*($|[;\s])", compact):
         return False
     return True
+
+
+def _is_incomplete_command(cmd: str) -> bool:
+    """Reject partial shell fragments that are likely to hang or misfire."""
+    stripped = cmd.strip()
+    if not stripped:
+        return True
+
+    trivial = {"(", ")", "{", "}", "[", "]", "'", '"', "`", "|", "||", "&&", ";"}
+    if stripped in trivial:
+        return True
+
+    if stripped.endswith(("|", "||", "&&", "\\", "; do", "; then")):
+        return True
+
+    if stripped.count("(") != stripped.count(")"):
+        return True
+    if stripped.count("{") != stripped.count("}"):
+        return True
+
+    # Unbalanced quotes are almost always incomplete input in this context.
+    if stripped.count("'") % 2 != 0:
+        return True
+    if stripped.count('"') % 2 != 0:
+        return True
+
+    first = stripped.split()[0].lower() if stripped.split() else ""
+    if first in {"if", "for", "while", "until", "case", "select", "function"} and "\n" not in cmd:
+        return True
+
+    return False
+
+
+def _command_preview(cmd: str, limit: int = 120) -> str:
+    """One-line preview for logs/discord."""
+    compact = " ".join(cmd.split())
+    if len(compact) <= limit:
+        return compact
+    return f"{compact[:limit]}..."
 
 
 def parse_read(reply: str) -> str | None:
@@ -1074,6 +1173,7 @@ def task_scheduler_loop():
                         continue
                     if now >= next_fire:
                         ui_print(f"\n[tasks] firing: {name}\n")
+                        discord_event("task", f"task fired: {name}")
                         attend(task["prompt"], source="autonomous")
                         _task_fire_times[name] = _next_fire(task["schedule"], now)
         except Exception as e:
@@ -1141,6 +1241,9 @@ def start_watcher():
                                 return
                             _last_shell_journal_line = last
                         if "[you]:" in last:
+                            cmd_part = last.split("[you]:", 1)[-1].strip()
+                            if "__MANTIS_DONE__" in cmd_part or "MANTIS_DONE" in cmd_part:
+                                return
                             attend(f"you ran in terminal: {last}", source="shell_journal")
                 except Exception:
                     pass
@@ -1298,6 +1401,8 @@ def act(context: dict) -> str:
         "  SEARCH: <query>\n"
         "  FETCH: <url>\n"
         "  SKILL: <url-or-path>\n\n"
+        "For COMMAND:, emit one complete runnable command/script only.\n"
+        "Never emit partial fragments like `(`, `awk '`, `if`, or unclosed quotes.\n"
         "Tool result will be fed back. Otherwise reply directly."
     )
 
@@ -1317,9 +1422,22 @@ def act(context: dict) -> str:
     if not cmd:
         cmd = parse_command_fallback(reply)
     if cmd:
+        if _is_incomplete_command(cmd):
+            preview = _command_preview(cmd, 80)
+            ui_print(f"\n  [skipped incomplete command: {preview}]")
+            attend(
+                f"command skipped: incomplete shell fragment `{preview}`. Emit a complete runnable COMMAND.",
+                source="tool",
+            )
+            discord_event("warn", f"skipped incomplete command `{preview}`")
+            cmd = None
+            reply = "(skipped)"
+    if cmd:
         if not _is_safe_command(cmd):
-            ui_print(f"\n  [skipped unsafe command: {cmd[:60]}...]\n")
+            preview = _command_preview(cmd, 80)
+            ui_print(f"\n  [skipped unsafe command: {preview}]")
             attend("command skipped: failed safety check", source="tool")
+            discord_event("warn", "skipped unsafe command")
             cmd = None
             reply = "(skipped)"
     if cmd:
@@ -1328,14 +1446,20 @@ def act(context: dict) -> str:
         if any(stripped.startswith(c) for c in INTERACTIVE_COMMANDS):
             alt = SAFE_ALTERNATIVES.get(base)
             if alt:
-                ui_print(f"\n  [blocked interactive: {cmd} -> using: {alt}]")
+                ui_print(f"\n  [blocked interactive: {_command_preview(cmd, 80)} -> using: {alt}]")
+                discord_event(
+                    "warn",
+                    f"blocked interactive `{_command_preview(cmd, 60)}`, using safe alternative",
+                )
                 cmd = alt
             else:
-                ui_print(f"\n  [blocked interactive command: {cmd}]")
+                preview = _command_preview(cmd, 80)
+                ui_print(f"\n  [blocked interactive command: {preview}]")
                 attend(
                     f"blocked: {cmd} is interactive — suggest a non-interactive alternative",
                     source="tool",
                 )
+                discord_event("warn", f"blocked interactive `{preview}`")
                 reply = reply[: reply.index("COMMAND:")].strip() or f"(blocked: {cmd})"
                 cmd = None
         if cmd is None:
@@ -1347,15 +1471,22 @@ def act(context: dict) -> str:
                 normalized.startswith(prefix) for prefix in ASYNC_COMMAND_PREFIXES
             )
             if is_long:
-                ui_print(f"\n  [running async script: {cmd[:60].strip()}...]\n")
+                preview = _command_preview(cmd, 120)
+                ui_print(f"\n  [running async script: {preview}]")
+                discord_event("run", f"`{preview}`")
                 run_script_async(cmd)
                 reply = "(running...)"
             else:
-                ui_print(f"\n  [running: {cmd[:60]}]")
+                preview = _command_preview(cmd, 120)
+                ui_print(f"\n  [running: {preview}]")
+                started = time.time()
+                discord_event("run", f"`{preview}`")
                 result = run_script(cmd, timeout=30)
+                elapsed = round(time.time() - started, 1)
                 ui_print(f"  {result[:200]}\n")
                 _log_to_shell_journal(cmd, result, actor="mantis")
                 attend(f"command result for `{cmd[:80]}`:\n{result}", source="tool")
+                discord_event("done", f"`{preview}` done ({elapsed}s)\n{result[:300]}")
                 reply = "(ran command)"
 
     read_path = parse_read(reply)
@@ -1363,6 +1494,7 @@ def act(context: dict) -> str:
         ui_print(f"\n  [reading: {read_path}]")
         contents = read_file(read_path)
         ui_print(f"  ({len(contents)} chars)\n")
+        discord_event("read", f"`{read_path}` ({len(contents)} chars)")
         attend(f"file contents of {read_path}:\n{contents}", source="tool")
         reply = reply[: reply.index("READ:")].strip() or "(read file)"
 
@@ -1370,16 +1502,20 @@ def act(context: dict) -> str:
     if write_result:
         wpath, wcontent = write_result
         ui_print(f"\n  [writing: {wpath}]")
+        discord_event("write", f"`{wpath}`")
         result = write_file(wpath, wcontent)
         ui_print(f"  {result}\n")
+        discord_event("done", result[:300])
         attend(f"file write result: {result}", source="tool")
         reply = reply[: reply.index("WRITE:")].strip() or "(wrote file)"
 
     screenshot_path = parse_screenshot(reply)
     if screenshot_path:
         ui_print(f"\n  [screenshot: {screenshot_path}]")
+        discord_event("info", f"screenshot `{screenshot_path}`")
         result = take_screenshot(screenshot_path)
         ui_print(f"  {result}\n")
+        discord_event("done", result[:300])
         attend(f"screenshot result: {result}", source="tool")
         reply = reply[: reply.index("SCREENSHOT:")].strip() or "(took screenshot)"
 
@@ -1387,40 +1523,51 @@ def act(context: dict) -> str:
     if click_coords:
         x, y = click_coords
         ui_print(f"\n  [click: {x},{y}]")
+        discord_event("info", f"click `{x},{y}`")
         result = mouse_click(x, y)
         ui_print(f"  {result}\n")
+        discord_event("done", result[:300])
         attend(f"click result: {result}", source="tool")
         reply = reply[: reply.index("CLICK:")].strip() or "(clicked)"
 
     type_text = parse_type(reply)
     if type_text:
         ui_print(f"\n  [type: {type_text}]")
+        discord_event("info", f"type `{type_text[:80]}`")
         result = keyboard_type(type_text)
         ui_print(f"  {result}\n")
+        discord_event("done", result[:300])
         attend(f"type result: {result}", source="tool")
         reply = reply[: reply.index("TYPE:")].strip() or "(typed)"
 
     search_query = parse_search(reply)
     if search_query:
         ui_print(f"\n  [searching: {search_query}]")
+        discord_event("search", f"`{search_query[:120]}`")
         result = web_search(search_query)
         ui_print(f"  ({len(result)} chars)\n")
+        discord_event("done", f"search returned {len(result)} chars")
         attend(f"search results: {result}", source="search")
         reply = reply[: reply.index("SEARCH:")].strip() or "(searched)"
 
     fetch_url = parse_fetch(reply)
     if fetch_url:
         ui_print(f"\n  [fetching: {fetch_url}]")
+        discord_event("fetch", f"`{fetch_url}`")
         result = web_fetch(fetch_url)
         ui_print(f"  ({len(result)} chars)\n")
+        discord_event("done", f"fetch returned {len(result)} chars")
         attend(f"fetched content from {fetch_url}:\n{result}", source="search")
         reply = reply[: reply.index("FETCH:")].strip() or "(fetched)"
 
     skill_source = parse_skill(reply)
     if skill_source:
         ui_print(f"\n  [loading skill: {skill_source}]")
+        discord_event("skill", f"loading `{skill_source}`")
         result = load_skill(skill_source)
         ui_print(f"  ({len(result)} chars)\n")
+        skill_name = Path(skill_source).name if "://" not in skill_source else skill_source.split("/")[-1]
+        discord_event("done", f"skill ready: {skill_name[:80]}")
         attend(f"skill loaded: {result}", source="skill")
         reply = reply[: reply.index("SKILL:")].strip() or "(loaded skill)"
 
