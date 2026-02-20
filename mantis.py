@@ -583,6 +583,9 @@ def load_soul() -> str:
 _shell: pexpect.spawn | None = None
 _shell_lock = threading.Lock()
 _shell_io_lock = threading.Lock()
+_async_shell: pexpect.spawn | None = None
+_async_shell_lock = threading.Lock()
+_async_shell_io_lock = threading.Lock()
 _SHELL_PROMPT = "__MANTIS_DONE__"
 
 ASYNC_COMMAND_PREFIXES = [
@@ -646,6 +649,17 @@ def _reset_shell() -> None:
         _shell = None
 
 
+def _reset_async_shell() -> None:
+    global _async_shell
+    with _async_shell_lock:
+        if _async_shell is not None:
+            try:
+                _async_shell.terminate(force=True)
+            except Exception:
+                pass
+        _async_shell = None
+
+
 def _get_shell() -> pexpect.spawn:
     global _shell
     with _shell_lock:
@@ -660,6 +674,22 @@ def _get_shell() -> pexpect.spawn:
             shell.expect(_SHELL_PROMPT, timeout=5)
             _shell = shell
         return _shell
+
+
+def _get_async_shell() -> pexpect.spawn:
+    global _async_shell
+    with _async_shell_lock:
+        if _async_shell is None or not _async_shell.isalive():
+            shell = pexpect.spawn(
+                "/bin/bash",
+                encoding="utf-8",
+                timeout=None,
+            )
+            shell.sendline("export TERM=dumb")
+            shell.sendline(f'export PS1="{_SHELL_PROMPT} "')
+            shell.expect(_SHELL_PROMPT, timeout=5)
+            _async_shell = shell
+        return _async_shell
 
 
 def _shell_output(output: str, cmd: str) -> str:
@@ -686,16 +716,20 @@ def run_command_async(cmd: str) -> None:
 
     def _run():
         try:
-            result = _run_shell_command(cmd, timeout=60)
+            with _async_shell_io_lock:
+                shell = _get_async_shell()
+                shell.sendline(cmd)
+                shell.expect(_SHELL_PROMPT, timeout=60)
+                result = _shell_output(shell.before.strip(), cmd)
             _log_to_shell_journal(cmd, result, actor="mantis")
             attend(f"shell result for `{cmd}`:\n{result}", source="shell")
         except pexpect.TIMEOUT:
-            _reset_shell()
+            _reset_async_shell()
             result = "timed out after 60s"
             _log_to_shell_journal(cmd, result, actor="mantis")
             attend(f"shell result for `{cmd}`: {result}", source="shell")
         except Exception as e:
-            _reset_shell()
+            _reset_async_shell()
             result = f"error — {e}"
             _log_to_shell_journal(cmd, result, actor="mantis")
             attend(f"shell result for `{cmd}`: {result}", source="shell")
@@ -759,7 +793,20 @@ def parse_command_fallback(reply: str) -> str | None:
     first = lines[0]
     if first.startswith("$"):
         first = first[1:].strip()
+    if len(first) < 4:
+        return None
     return first or None
+
+
+def _is_safe_command(cmd: str) -> bool:
+    """Reject commands likely to hang waiting for more shell input."""
+    if cmd.count("'") % 2 != 0:
+        return False
+    if cmd.count('"') % 2 != 0:
+        return False
+    if cmd.rstrip().endswith("\\"):
+        return False
+    return True
 
 
 def parse_read(reply: str) -> str | None:
@@ -1321,10 +1368,17 @@ def act(context: dict) -> str:
     reply = r.json()["choices"][0]["message"]["content"].strip()
 
     cmd = parse_command(reply)
-    cmd_from_fallback = False
     if not cmd:
         cmd = parse_command_fallback(reply)
-        cmd_from_fallback = cmd is not None
+    if cmd:
+        if not _is_safe_command(cmd):
+            ui_print(f"\n  [skipped unsafe command: {cmd[:60]}...]\n")
+            attend(
+                f"command skipped (unclosed quote or continuation): {cmd[:100]}",
+                source="tool",
+            )
+            cmd = None
+            reply = "(skipped unsafe command)"
     if cmd:
         stripped = cmd.strip().lower()
         base = stripped.split()[0] if stripped else ""
