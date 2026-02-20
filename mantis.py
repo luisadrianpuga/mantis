@@ -190,6 +190,10 @@ def _ensure_tasks_file() -> None:
 - name: soul review
   schedule: weekly sunday 10am
   prompt: Review this week's memory. What did you learn about the user's preferences, working style, or goals? Propose 1-3 short additions to SOUL.md as a numbered list. Do not write anything yet - wait for the user to say 'approve soul'.
+
+- name: learn review
+  schedule: weekly sunday 11am
+  prompt: Review the last 50 command outcomes. Identify what commands worked, which failed or returned empty, and propose targeted updates to relevant skill files. Summarize your learning in one short line and store it in memory.
 """
     try:
         TASKS_PATH.write_text(default, encoding="utf-8")
@@ -274,6 +278,23 @@ def _get_fts_conn() -> sqlite3.Connection:
         USING fts5(text, source, ts)
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS command_outcomes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            cmd TEXT NOT NULL,
+            result TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            source TEXT NOT NULL,
+            skill TEXT,
+            duration_ms INTEGER
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_command_outcomes_ts ON command_outcomes(ts)"
+    )
     conn.commit()
     return conn
 
@@ -298,6 +319,97 @@ def fts_search(query: str, k: int = TOP_K) -> list[str]:
             (query, k),
         ).fetchall()
     return [r[0] for r in rows]
+
+
+def classify_outcome(result: str) -> str:
+    text = (result or "").strip()
+    lower = text.lower()
+    if "timed out" in lower:
+        return "timeout"
+    if text in {"", "(no output)"}:
+        return "empty"
+    failure_markers = ("error", "failed", "traceback", "not found", "permission denied")
+    if any(marker in lower for marker in failure_markers):
+        return "fail"
+    return "success"
+
+
+def store_command_outcome(
+    cmd: str,
+    result: str,
+    source: str,
+    *,
+    skill: str = "",
+    duration_ms: int | None = None,
+    ts: str | None = None,
+) -> str:
+    outcome = classify_outcome(result)
+    when = ts or datetime.utcnow().isoformat()
+    with fts_lock:
+        fts_conn.execute(
+            """
+            INSERT INTO command_outcomes(ts, cmd, result, outcome, source, skill, duration_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (when, cmd[:4000], result[:4000], outcome, source, skill, duration_ms),
+        )
+        fts_conn.commit()
+    return outcome
+
+
+def recent_command_outcomes(limit: int = 50) -> list[dict]:
+    with fts_lock:
+        rows = fts_conn.execute(
+            """
+            SELECT ts, cmd, outcome, source, COALESCE(skill, ''), COALESCE(duration_ms, 0)
+            FROM command_outcomes
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [
+        {
+            "ts": r[0],
+            "cmd": r[1],
+            "outcome": r[2],
+            "source": r[3],
+            "skill": r[4],
+            "duration_ms": r[5],
+        }
+        for r in rows
+    ]
+
+
+def outcome_digest(limit: int = 25) -> str:
+    rows = recent_command_outcomes(limit)
+    if not rows:
+        return "No command outcomes recorded yet."
+    counts: dict[str, int] = defaultdict(int)
+    for row in rows:
+        counts[row["outcome"]] += 1
+    latest = rows[0]
+    parts = [
+        f"recent_outcomes={len(rows)}",
+        f"success={counts.get('success', 0)}",
+        f"empty={counts.get('empty', 0)}",
+        f"fail={counts.get('fail', 0)}",
+        f"timeout={counts.get('timeout', 0)}",
+        f"latest={latest['outcome']}:{_command_preview(latest['cmd'], 60)}",
+    ]
+    return " | ".join(parts)
+
+
+def recent_outcome_lines(limit: int = 12) -> str:
+    rows = recent_command_outcomes(limit)
+    if not rows:
+        return "(none)"
+    lines = []
+    for row in rows:
+        lines.append(
+            f"- {row['ts']} [{row['outcome']}] ({row['source']}) {_command_preview(row['cmd'], 90)}"
+        )
+    return "\n".join(lines)
 
 
 # -- MEMORY.md ----------------------------------------------------------------
@@ -679,6 +791,34 @@ def _is_shell_log_path(path: str) -> bool:
         return path.replace("\\", "/").endswith("shell.log")
 
 
+def _is_shell_journal_noise(cmd: str) -> bool:
+    """Ignore shell setup/meta commands from shared journal events."""
+    c = (cmd or "").strip().lower()
+    if not c:
+        return True
+
+    noise_prefixes = (
+        "export term=",
+        "export ps1=",
+        "export prompt_command=",
+        "source ~/.bashrc",
+        ". ~/.bashrc",
+        "_mantis_log_command",
+        "history 1",
+    )
+    if any(c.startswith(prefix) for prefix in noise_prefixes):
+        return True
+
+    if "__mantis_done__" in c or "mantis_done" in c:
+        return True
+
+    # ignore raw function-definition fragments from .bashrc hooks
+    if c in {"{", "}", "fi", "then", "do", "done"}:
+        return True
+
+    return False
+
+
 def _strip_ansi(text: str) -> str:
     cleaned = text
     cleaned = re.sub(r"\x1b\[[0-9;]*[mGKHF]", "", cleaned)
@@ -728,17 +868,50 @@ def run_script(cmd: str, timeout: int = 30) -> str:
                 pass
 
 
-def run_script_async(cmd: str) -> None:
+def _record_outcome_and_learn(
+    cmd: str,
+    result: str,
+    source: str,
+    *,
+    duration_ms: int | None = None,
+    skill: str = "",
+) -> str:
+    outcome = store_command_outcome(
+        cmd,
+        result,
+        source,
+        skill=skill,
+        duration_ms=duration_ms,
+    )
+    preview = _command_preview(cmd, 90)
+    attend(
+        (
+            f"command outcome [{outcome}] source={source} "
+            f"cmd={preview} result={result[:220]}"
+        ),
+        source="learning",
+    )
+    return outcome
+
+
+def run_script_async(cmd: str, trigger_source: str = "tool") -> None:
     """Run script asynchronously and feed result back as a shell event."""
 
     def _run():
         started = time.time()
         result = run_script(cmd, timeout=60)
         elapsed = round(time.time() - started, 1)
+        duration_ms = int((time.time() - started) * 1000)
         preview = _command_preview(cmd, 120)
         _log_to_shell_journal(cmd, result, actor="mantis")
+        outcome = _record_outcome_and_learn(
+            cmd,
+            result,
+            trigger_source,
+            duration_ms=duration_ms,
+        )
         attend(f"shell result for `{cmd[:80]}`:\n{result}", source="shell")
-        if "timed out" in result.lower() or result.lower().startswith("(script error"):
+        if outcome in {"timeout", "fail"}:
             discord_event("error", f"`{preview}` - {result[:140]}")
         else:
             discord_event("shell", f"`{preview}` done ({elapsed}s)\n{result[:300]}")
@@ -781,6 +954,22 @@ def _flatten_command(cmd: str) -> str:
     return " ".join(parts).strip()
 
 
+def _normalize_command(cmd: str) -> str:
+    """Normalize model-emitted command text before validation/execution."""
+    cleaned = cmd or ""
+    cleaned = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", cleaned)
+    cleaned = cleaned.strip()
+
+    # Strip optional fenced wrappers if model leaked markdown.
+    cleaned = re.sub(r"^```(?:bash|sh|shell)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    if cleaned.startswith("$"):
+        cleaned = cleaned[1:].strip()
+
+    return cleaned.strip()
+
+
 def parse_command(reply: str) -> str | None:
     tool_markers = "READ|WRITE|SCREENSHOT|CLICK|TYPE|SEARCH|FETCH|SKILL"
     m = re.search(
@@ -790,7 +979,7 @@ def parse_command(reply: str) -> str | None:
     )
     if not m:
         return None
-    cmd = m.group(1).strip()
+    cmd = _normalize_command(m.group(1).strip())
     if not cmd:
         return None
     if "\n" in cmd:
@@ -815,7 +1004,11 @@ def parse_command_fallback(reply: str) -> str | None:
         return None
     if lines[0].lstrip().startswith("$"):
         lines[0] = lines[0].lstrip()[1:].strip()
-    cmd = "\n".join(lines).strip()
+    cmd = _normalize_command("\n".join(lines).strip())
+    if "\n" in cmd:
+        cmd = _flatten_command(cmd)
+    if cmd == "(":
+        return None
     if len(cmd) < 4:
         return None
     return cmd or None
@@ -839,6 +1032,9 @@ def _is_incomplete_command(cmd: str) -> bool:
     """Reject partial shell fragments that are likely to hang or misfire."""
     stripped = cmd.strip()
     if not stripped:
+        return True
+
+    if re.fullmatch(r"[\(\)\[\]\{\}\"'`|;&\\\s]+", stripped):
         return True
 
     trivial = {"(", ")", "{", "}", "[", "]", "'", '"', "`", "|", "||", "&&", ";"}
@@ -1262,7 +1458,7 @@ def start_watcher():
                             _last_shell_journal_line = last
                         if "[you]:" in last:
                             cmd_part = last.split("[you]:", 1)[-1].strip()
-                            if "__MANTIS_DONE__" in cmd_part or "MANTIS_DONE" in cmd_part:
+                            if _is_shell_journal_noise(cmd_part):
                                 return
                             attend(f"you ran in terminal: {last}", source="shell_journal")
                 except Exception:
@@ -1368,6 +1564,18 @@ def associate(event: dict) -> dict | None:
         md_append(text, source)
         return None
 
+    if source == "learning":
+        vec = embed_text(text)
+        collection.add(
+            ids=[str(uuid.uuid4())],
+            documents=[text],
+            embeddings=[vec],
+            metadatas=[{"ts": ts, "source": source}],
+        )
+        fts_store(text, source, ts)
+        md_append(text, source)
+        return None
+
     vec = embed_text(text)
 
     vec_results = collection.query(query_embeddings=[vec], n_results=TOP_K)
@@ -1402,6 +1610,8 @@ def act(context: dict) -> str:
     soul = load_soul()
     skills_block = load_all_skills()
     memory_block = "\n".join(f"- {m}" for m in context["memory"]) or "(none yet)"
+    outcomes_block = outcome_digest(25)
+    recent_outcomes_block = recent_outcome_lines(12)
     source = context.get("source", "user")
 
     system = f"{soul}\n\n"
@@ -1410,6 +1620,8 @@ def act(context: dict) -> str:
     system += (
         "---\n"
         f"Relevant memory:\n{memory_block}\n\n"
+        f"Recent command outcomes:\n{outcomes_block}\n\n"
+        f"Recent outcome log:\n{recent_outcomes_block}\n\n"
         "---\n"
         "Tools - emit one or more per reply if needed:\n"
         "  COMMAND: <shell command>\n"
@@ -1494,7 +1706,7 @@ def act(context: dict) -> str:
                 preview = _command_preview(cmd, 120)
                 ui_print(f"\n  [running async script: {preview}]")
                 discord_event("run", f"`{preview}`")
-                run_script_async(cmd)
+                run_script_async(cmd, trigger_source=source)
                 reply = "(running...)"
             else:
                 preview = _command_preview(cmd, 120)
@@ -1503,8 +1715,15 @@ def act(context: dict) -> str:
                 discord_event("run", f"`{preview}`")
                 result = run_script(cmd, timeout=30)
                 elapsed = round(time.time() - started, 1)
+                duration_ms = int((time.time() - started) * 1000)
                 ui_print(f"  {result[:200]}\n")
                 _log_to_shell_journal(cmd, result, actor="mantis")
+                _record_outcome_and_learn(
+                    cmd,
+                    result,
+                    source,
+                    duration_ms=duration_ms,
+                )
                 attend(f"command result for `{cmd[:80]}`:\n{result}", source="tool")
                 discord_event("done", f"`{preview}` done ({elapsed}s)\n{result[:300]}")
                 reply = "(ran command)"
