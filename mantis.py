@@ -495,6 +495,7 @@ def _get_shell() -> pexpect.spawn:
                 encoding="utf-8",
                 timeout=None,
             )
+            shell.sendline("export TERM=dumb")
             shell.sendline(f'export PS1="{_SHELL_PROMPT} "')
             shell.expect(_SHELL_PROMPT, timeout=5)
             _shell = shell
@@ -506,6 +507,9 @@ def _shell_output(output: str, cmd: str) -> str:
     if lines and lines[0].strip() == cmd.strip():
         lines = lines[1:]
     cleaned = "\n".join(lines).strip()
+    cleaned = re.sub(r"\x1b\[[0-9;]*[mGKHF]", "", cleaned)
+    cleaned = re.sub(r"\x1b\][^\x07]*\x07", "", cleaned)
+    cleaned = cleaned.strip()
     return cleaned or "(no output)"
 
 
