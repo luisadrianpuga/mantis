@@ -7,10 +7,23 @@
   </picture>
 </p>
 
+Inspired by Craig Reynolds' Boids, Mantis applies a minimal local-rule approach to emergent behavior: simple rules, repeated continuously, produce adaptive autonomous behavior.
+
 Mantis is a local-first Python agent runtime built around a three-rule loop:
 `ATTEND -> ASSOCIATE -> ACT`.
 
 It runs as a single process (`mantis.py`) for local experimentation and autonomous workflows.
+
+## Inspiration: Boids -> 3 Rules
+
+Boids showed that complex flocking can emerge from a few local rules.
+Mantis takes the same design principle for agent autonomy:
+
+1. `ATTEND`: capture signals (user input, tools, files, autonomous prompts).
+2. `ASSOCIATE`: connect the signal to memory and context.
+3. `ACT`: decide and execute the next concrete step.
+
+Autonomy comes from this loop running continuously across many event sources, not from a single giant planner pass.
 
 ## What It Does (Current)
 
