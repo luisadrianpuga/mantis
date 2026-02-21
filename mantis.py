@@ -946,7 +946,11 @@ def _make_noninteractive(cmd: str) -> str:
     if "debian_frontend=" in stripped.lower():
         return cmd
     if re.match(r"^(sudo\s+)?apt(-get)?\s+(install|upgrade|dist-upgrade)\b", stripped):
-        return f"DEBIAN_FRONTEND=noninteractive {stripped}"
+        return (
+            "DEBIAN_FRONTEND=noninteractive "
+            "DEBCONF_NONINTERACTIVE_SEEN=true "
+            f"{stripped}"
+        )
     return cmd
 
 
