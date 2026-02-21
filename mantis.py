@@ -682,6 +682,9 @@ _task_lock = threading.Lock()
 _recent_inputs: list[str] = []
 _recent_inputs_lock = threading.Lock()
 _RECENT_INPUT_WINDOW = 5
+_last_event_loop_error_msg = ""
+_last_event_loop_error_ts = 0.0
+_suppressed_event_loop_errors = 0
 _META_REPLIES = {
     "(running...)",
     "(ran command)",
@@ -1763,12 +1766,35 @@ def process_events_once() -> None:
                     discord_post(reply)
 
 
+def _report_event_loop_error(err: Exception) -> None:
+    """Rate-limit repeated event loop error logs to avoid console spam."""
+    global _last_event_loop_error_msg
+    global _last_event_loop_error_ts
+    global _suppressed_event_loop_errors
+
+    now = time.time()
+    msg = str(err).strip() or err.__class__.__name__
+    same_error = msg == _last_event_loop_error_msg and (now - _last_event_loop_error_ts) < 10
+
+    if same_error:
+        _suppressed_event_loop_errors += 1
+        return
+
+    if _suppressed_event_loop_errors > 0:
+        ui_print(f"[error] suppressed {_suppressed_event_loop_errors} repeated event loop errors")
+        _suppressed_event_loop_errors = 0
+
+    _last_event_loop_error_msg = msg
+    _last_event_loop_error_ts = now
+    ui_print(f"\n[error] event loop recovered: {msg}\n")
+
+
 def event_loop():
     while not _event_loop_stop.is_set():
         try:
             process_events_once()
         except Exception as e:
-            ui_print(f"\n[error] event loop recovered: {e}\n")
+            _report_event_loop_error(e)
         time.sleep(0.2)
 
 
@@ -1882,13 +1908,22 @@ def act(context: dict) -> str:
     messages.extend(history_snapshot())
     messages.append({"role": "user", "content": context["input"]})
 
-    r = httpx.post(
-        f"{LLM_BASE}/chat/completions",
-        json={"model": MODEL, "messages": messages, "max_tokens": MAX_TOKENS},
-        timeout=MAX_LLM_TIMEOUT,
-    )
-    r.raise_for_status()
-    reply = r.json()["choices"][0]["message"]["content"].strip()
+    try:
+        r = httpx.post(
+            f"{LLM_BASE}/chat/completions",
+            json={"model": MODEL, "messages": messages, "max_tokens": MAX_TOKENS},
+            timeout=MAX_LLM_TIMEOUT,
+        )
+        r.raise_for_status()
+        reply = r.json()["choices"][0]["message"]["content"].strip()
+    except httpx.TimeoutException:
+        return (
+            f"(llm timeout after {MAX_LLM_TIMEOUT}s; will continue running and retry on next event)"
+        )
+    except httpx.RequestError as e:
+        return f"(llm request error: {e})"
+    except Exception as e:
+        return f"(llm error: {e})"
 
     cmd = parse_command(reply)
     if not cmd:
