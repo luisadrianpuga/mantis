@@ -66,6 +66,10 @@ MIN_FAILURES_BEFORE_SKILL_UPDATE = int(
     os.getenv("MIN_FAILURES_BEFORE_SKILL_UPDATE", "3")
 )
 SKILL_UPDATE_WINDOW = int(os.getenv("SKILL_UPDATE_WINDOW", "50"))
+MAX_PROMPT_CHARS = int(os.getenv("MAX_PROMPT_CHARS", "24000"))
+MAX_SYSTEM_CHARS = int(os.getenv("MAX_SYSTEM_CHARS", "12000"))
+MAX_HISTORY_MSG_CHARS = int(os.getenv("MAX_HISTORY_MSG_CHARS", "3000"))
+MAX_USER_INPUT_CHARS = int(os.getenv("MAX_USER_INPUT_CHARS", "4000"))
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 DISCORD_CHANNEL_ID = _env_int("DISCORD_CHANNEL_ID", 0)
 DISCORD_ACTIVITY_FEED = _env_bool("DISCORD_ACTIVITY_FEED", True)
@@ -634,6 +638,57 @@ def history_append(role: str, content: str, source: str = "user") -> None:
 def history_snapshot() -> list[dict]:
     with _history_lock:
         return list(_chat_history[-MAX_HISTORY:])
+
+
+def _truncate_text(text: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 18] + "\n...[truncated]"
+
+
+def _message_chars(messages: list[dict]) -> int:
+    total = 0
+    for m in messages:
+        total += len(m.get("content", "") or "")
+    return total
+
+
+def _compact_messages_for_context(
+    system_text: str,
+    history: list[dict],
+    user_text: str,
+    *,
+    max_total_chars: int = MAX_PROMPT_CHARS,
+) -> list[dict]:
+    system_trimmed = _truncate_text(system_text, MAX_SYSTEM_CHARS)
+    user_trimmed = _truncate_text(user_text, MAX_USER_INPUT_CHARS)
+
+    compact_history: list[dict] = []
+    for msg in history[-MAX_HISTORY:]:
+        role = msg.get("role", "user")
+        content = _truncate_text(msg.get("content", ""), MAX_HISTORY_MSG_CHARS)
+        compact_history.append({"role": role, "content": content})
+
+    messages = [{"role": "system", "content": system_trimmed}]
+    messages.extend(compact_history)
+    messages.append({"role": "user", "content": user_trimmed})
+
+    while len(messages) > 2 and _message_chars(messages) > max_total_chars:
+        # Drop oldest non-system history first.
+        del messages[1]
+
+    if _message_chars(messages) > max_total_chars:
+        available_for_system = max(1000, max_total_chars - len(user_trimmed) - 200)
+        messages[0]["content"] = _truncate_text(messages[0]["content"], available_for_system)
+
+    return messages
+
+
+def _is_context_overflow_error(err: Exception) -> bool:
+    text = str(err).lower()
+    return ("exceeds the available context size" in text) or ("maximum context length" in text)
 
 
 # -- Lane Queue ---------------------------------------------------------------
@@ -1872,7 +1927,11 @@ def associate(event: dict) -> dict | None:
 def act(context: dict) -> str:
     soul = load_soul()
     skills_block = load_all_skills()
+    if len(skills_block) > 4000:
+        skills_block = skills_block[:4000] + "\n...[skills truncated]"
     memory_block = "\n".join(f"- {m}" for m in context["memory"]) or "(none yet)"
+    if len(memory_block) > 2000:
+        memory_block = memory_block[:2000] + "\n...[truncated]"
     source = context.get("source", "user")
     active_skill: str = ""
 
@@ -1883,6 +1942,8 @@ def act(context: dict) -> str:
     if source in {"autonomous", "learning", "shell", "skill"}:
         outcomes_block = outcome_digest(25)
         recent_outcomes_block = recent_outcome_lines(8)
+        if len(outcomes_block) + len(recent_outcomes_block) > 3000:
+            recent_outcomes_block = recent_outcomes_block[:2000] + "\n...[truncated]"
         system += (
             f"Recent command outcomes:\n{outcomes_block}\n\n"
             f"Recent outcome log:\n{recent_outcomes_block}\n\n"
@@ -1904,9 +1965,13 @@ def act(context: dict) -> str:
         "Tool result will be fed back. Otherwise reply directly."
     )
 
-    messages = [{"role": "system", "content": system}]
-    messages.extend(history_snapshot())
-    messages.append({"role": "user", "content": context["input"]})
+    history = history_snapshot()
+    messages = _compact_messages_for_context(
+        system,
+        history,
+        context["input"],
+        max_total_chars=MAX_PROMPT_CHARS,
+    )
 
     try:
         r = httpx.post(
@@ -1916,6 +1981,30 @@ def act(context: dict) -> str:
         )
         r.raise_for_status()
         reply = r.json()["choices"][0]["message"]["content"].strip()
+    except httpx.HTTPStatusError as e:
+        if _is_context_overflow_error(e):
+            compact_messages = _compact_messages_for_context(
+                system,
+                history[-2:],
+                context["input"],
+                max_total_chars=max(4000, MAX_PROMPT_CHARS // 3),
+            )
+            try:
+                r = httpx.post(
+                    f"{LLM_BASE}/chat/completions",
+                    json={
+                        "model": MODEL,
+                        "messages": compact_messages,
+                        "max_tokens": min(MAX_TOKENS, 256),
+                    },
+                    timeout=MAX_LLM_TIMEOUT,
+                )
+                r.raise_for_status()
+                reply = r.json()["choices"][0]["message"]["content"].strip()
+            except Exception as retry_err:
+                return f"(llm context overflow; compact retry failed: {retry_err})"
+        else:
+            return f"(llm http error: {e})"
     except httpx.TimeoutException:
         return (
             f"(llm timeout after {MAX_LLM_TIMEOUT}s; will continue running and retry on next event)"
