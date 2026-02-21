@@ -468,6 +468,89 @@ def _is_skill_write(path: str) -> bool:
     return normalized.startswith(".agent/skills/") or "/skills/" in f"/{normalized}/"
 
 
+def _is_todo_write(path: str) -> bool:
+    normalized = path.replace("\\", "/").strip().lower()
+    return normalized.endswith("/todo_list.txt") or normalized == "todo_list.txt"
+
+
+def _looks_shell_like_task(text: str) -> bool:
+    lower = (text or "").strip().lower()
+    if not lower:
+        return True
+    if any(marker in lower for marker in ("command:", "read:", "write:", "fetch:", "skill:")):
+        return True
+    shell_markers = (
+        "&&",
+        "||",
+        ";",
+        "|",
+        "`",
+        "$(",
+        "sudo ",
+        " apt ",
+        " pip ",
+        " python ",
+        " bash",
+        " sh ",
+        " echo ",
+        " curl ",
+        " wget ",
+        " rm ",
+        " chmod ",
+        " chown ",
+    )
+    return any(marker in f" {lower} " for marker in shell_markers)
+
+
+def _is_valid_todo_content(content: str) -> tuple[bool, str]:
+    """
+    Require todo_list.txt to be simple task text (bullets/checklist/numbered lines),
+    not shell-like command fragments.
+    """
+    raw_lines = content.splitlines()
+    lines = [line.strip() for line in raw_lines if line.strip()]
+    if not lines:
+        return False, "todo_list.txt cannot be empty"
+
+    allowed_prefixes = ("- ", "* ", "[ ] ", "[x] ", "[X] ")
+    for line in lines:
+        task_text = line
+        if line.startswith(allowed_prefixes):
+            task_text = line.split(" ", 1)[1].strip() if " " in line else ""
+        elif re.match(r"^\d+\.\s+", line):
+            task_text = re.sub(r"^\d+\.\s+", "", line).strip()
+        else:
+            return False, f"invalid task format: `{line[:60]}`"
+
+        if len(task_text) < 3:
+            return False, f"task too short: `{line[:60]}`"
+        if _looks_shell_like_task(task_text):
+            return False, f"shell-like task rejected: `{line[:60]}`"
+
+    return True, "ok"
+
+
+def _guarded_todo_write(wpath: str, wcontent: str, reply: str) -> tuple[str, bool]:
+    """
+    Block malformed todo_list.txt writes so command-like content does not corrupt tasks.
+    Returns (updated_reply, was_blocked).
+    """
+    valid, reason = _is_valid_todo_content(wcontent)
+    if valid:
+        return reply, False
+
+    ui_print(f"\n  [todo write blocked]\n  {reason}\n")
+    discord_event("warn", f"todo write blocked — {reason[:180]}")
+    attend(
+        f"todo_list.txt write blocked: {reason}. "
+        "Write todo_list.txt as plain task lines (bullets/checklist/numbered), "
+        "not commands.",
+        source="tool",
+    )
+    updated_reply = reply[: reply.index("WRITE:")].strip() or "(write blocked)"
+    return updated_reply, True
+
+
 def _extract_deprecated_commands(old_content: str, new_content: str) -> list[str]:
     """
     Find COMMAND lines present in old content but removed from new content.
@@ -2147,6 +2230,8 @@ def act(context: dict) -> str:
         was_blocked = False
         if _is_skill_write(wpath):
             reply, was_blocked = _guarded_skill_write(wpath, wcontent, reply)
+        if not was_blocked and _is_todo_write(wpath):
+            reply, was_blocked = _guarded_todo_write(wpath, wcontent, reply)
 
         if not was_blocked:
             ui_print(f"\n  [writing: {wpath}]")
