@@ -1,0 +1,3 @@
+- research remote SWE job opportunities
+- update resume.md with recent projects
+- research AI/tech RSS feeds for news skill
