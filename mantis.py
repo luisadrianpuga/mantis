@@ -679,6 +679,9 @@ _discord_ready = threading.Event()
 _discord_channel = None
 _task_fire_times: dict[str, datetime] = {}
 _task_lock = threading.Lock()
+_recent_inputs: list[str] = []
+_recent_inputs_lock = threading.Lock()
+_RECENT_INPUT_WINDOW = 5
 _META_REPLIES = {
     "(running...)",
     "(ran command)",
@@ -705,6 +708,12 @@ _DISCORD_ICONS = {
     "info": "ℹ️",
     "warn": "⚠️",
 }
+_PHANTOM_PHRASES = (
+    "has been updated to mark",
+    "file has been updated",
+    "tasks as completed",
+    "have been marked as complete",
+)
 
 
 def ui_print(message: str = "", redraw_prompt: bool = True) -> None:
@@ -929,11 +938,24 @@ def _strip_ansi(text: str) -> str:
     return cleaned.strip()
 
 
+def _make_noninteractive(cmd: str) -> str:
+    """Prepend DEBIAN_FRONTEND for apt install/upgrade commands."""
+    stripped = (cmd or "").strip()
+    if not stripped:
+        return cmd
+    if "debian_frontend=" in stripped.lower():
+        return cmd
+    if re.match(r"^(sudo\s+)?apt(-get)?\s+(install|upgrade|dist-upgrade)\b", stripped):
+        return f"DEBIAN_FRONTEND=noninteractive {stripped}"
+    return cmd
+
+
 def run_script(cmd: str, timeout: int = 30) -> str:
     """
     Write command text to a temp bash script and execute it atomically.
     Handles multi-line commands, subshells, awk, heredocs, and pipelines.
     """
+    cmd = _make_noninteractive(cmd)
     script_path = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -1076,6 +1098,10 @@ def _normalize_command(cmd: str) -> str:
     if cleaned.startswith("$"):
         cleaned = cleaned[1:].strip()
 
+    # If stray closing parens leaked from surrounding prose, trim extras.
+    while cleaned.endswith(")") and cleaned.count(")") > cleaned.count("("):
+        cleaned = cleaned[:-1].rstrip()
+
     return cleaned.strip()
 
 
@@ -1135,6 +1161,24 @@ def _is_safe_command(cmd: str) -> bool:
     if re.search(r"(^|[;\s])rm\s+-rf\s+/\s*($|[;\s])", compact):
         return False
     return True
+
+
+def _is_phantom_completion(text: str) -> bool:
+    lower = (text or "").lower()
+    return any(phrase in lower for phrase in _PHANTOM_PHRASES)
+
+
+def _is_duplicate_input(text: str) -> bool:
+    key = (text or "").strip()[:200]
+    if not key:
+        return False
+    with _recent_inputs_lock:
+        if key in _recent_inputs:
+            return True
+        _recent_inputs.append(key)
+        if len(_recent_inputs) > _RECENT_INPUT_WINDOW:
+            _recent_inputs.pop(0)
+    return False
 
 
 def _is_incomplete_command(cmd: str) -> bool:
@@ -1497,7 +1541,7 @@ HEARTBEAT_PROMPTS = [
     # Unfinished work
     "What has the user asked you to do that isn't finished yet? Be specific and surface it.",
     # Hardware awareness
-    "Check system health by running: now && cat /proc/loadavg && free -h",
+    "Run: COMMAND: cat /proc/loadavg && free -h && df -h",
     # Todo check
     "Is there a todo list? If so, read todo_list.txt and remind the user of anything incomplete.",
     # Memory synthesis
@@ -1741,7 +1785,14 @@ def associate(event: dict) -> dict | None:
     source = event.get("source", "user")
     ts = event["ts"]
 
+    # Drop duplicate autonomous/tool inputs to prevent heartbeat pileups.
+    if source in {"autonomous", "tool"} and _is_duplicate_input(text):
+        return None
+
     if source == "agent_echo":
+        if _is_phantom_completion(text):
+            # Don't store hallucinated completion claims in memory.
+            return None
         fts_store(text, source, ts)
         md_append(text, source)
         return None
