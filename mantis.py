@@ -855,6 +855,38 @@ _PHANTOM_PHRASES = (
     "tasks as completed",
     "have been marked as complete",
 )
+PRIORITY_SOURCES = {"user", "discord"}
+BACKGROUND_SOURCES = {"autonomous", "filesystem", "shell_journal", "learning"}
+_MEMORY_NOISE_PATTERNS = (
+    "since inception",
+    "since you last ran this command",
+    "moon phase",
+    "day progress:",
+    "weather in severn",
+    "load average:",
+    "cpu temp:",
+    "waxing",
+    "waning",
+)
+_FILLER_PHRASES = (
+    "is there anything",
+    "would you like",
+    "let me know",
+    "please let me know",
+    "feel free to ask",
+    "if you need",
+    "if you have any",
+    "how can i assist",
+    "how can i help",
+    "i'm here to help",
+    "i'm ready to",
+    "shall i proceed",
+    "do you want me to",
+    "would you like me to",
+    "anything else",
+    "further assistance",
+    "further details",
+)
 
 
 def ui_print(message: str = "", redraw_prompt: bool = True) -> None:
@@ -1324,6 +1356,42 @@ def _is_duplicate_input(text: str) -> bool:
         if len(_recent_inputs) > _RECENT_INPUT_WINDOW:
             _recent_inputs.pop(0)
     return False
+
+
+def _is_memory_noise(text: str) -> bool:
+    lower = (text or "").lower()
+    return any(pattern in lower for pattern in _MEMORY_NOISE_PATTERNS)
+
+
+def _is_worth_posting(reply: str, source: str) -> bool:
+    """
+    Return True only if this reply has enough value to post to Discord.
+    Direct Discord responses always post. Background noise never does.
+    """
+    # Always respond to Luis directly.
+    if source == "discord":
+        return True
+
+    # Meta replies are tool scaffolding, not content.
+    if reply in _META_REPLIES:
+        return False
+
+    # Too short to be meaningful.
+    if len(reply.strip()) < 30:
+        return False
+
+    # Pure filler - question fishing or offers to help.
+    lower = reply.lower().strip()
+    filler_count = sum(1 for phrase in _FILLER_PHRASES if phrase in lower)
+    if filler_count >= 2:
+        return False
+
+    # Ends with a question but has no actual content before it.
+    lines = [l.strip() for l in reply.strip().splitlines() if l.strip()]
+    if len(lines) == 1 and lines[0].endswith("?"):
+        return False
+
+    return True
 
 
 def _is_incomplete_command(cmd: str) -> bool:
@@ -1865,8 +1933,13 @@ def start_watcher():
 
 # -- Event processing ---------------------------------------------------------
 def process_events_once() -> None:
-    events = lane_queue.drain()
-    for event in events:
+    all_events = lane_queue.drain()
+
+    # Process user and discord first, background last.
+    priority = [e for e in all_events if e.get("source") in PRIORITY_SOURCES]
+    background = [e for e in all_events if e.get("source") not in PRIORITY_SOURCES]
+
+    for event in priority + background:
         source = event.get("source", "user")
         with lane_queue.lock(source):
             context = associate(event)
@@ -1885,7 +1958,7 @@ def process_events_once() -> None:
             elif source not in {"agent_echo", "tool"}:
                 ui_print(f"\nagent: {reply}\n")
             if source in {"discord", "autonomous", "shell", "shell_journal", "search", "skill"}:
-                if reply not in _META_REPLIES:
+                if _is_worth_posting(reply, source):
                     discord_post(reply)
 
 
@@ -1961,6 +2034,14 @@ def associate(event: dict) -> dict | None:
         fts_store(text, source, ts)
         md_append(text, source)
         return None
+
+    # Don't pollute recall with system status noise.
+    if _is_memory_noise(text):
+        # Keep markdown audit history, but skip vector and FTS storage.
+        md_append(text, source)
+        if source in {"autonomous", "tool"}:
+            return None
+        return {"input": text, "memory": [], "source": source}
 
     vec = embed_text(text)
 
