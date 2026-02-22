@@ -161,6 +161,19 @@ Treat `now` as grounding context only; continue the active user task unless a cr
 `now` is a trusted command that returns current time, weather, moon phase,
 system status and nearby network devices. Never simulate its output — always run it and wait for the real result.
 
+## Heartbeat
+Autonomous heartbeat runs every 15 minutes.
+Run `now` to stay oriented. Read the output. Stay quiet.
+Only speak up if something is genuinely wrong:
+- Disk over 85% full
+- Load average over 4.0
+- A user task explicitly left unresolved in the last session
+
+Otherwise silence is correct. Do not summarize memory, do not re-read
+todo_list.txt, do not ask what the user is working on.
+Scheduled tasks handle intentional autonomous work.
+Heartbeat is just a pulse - not a turn.
+
 ## Exploration Policy
 Before asking the user a clarifying question:
 1. Run at least 2 concrete checks (`pwd`, `ls`, `rg`, `cat` as relevant).

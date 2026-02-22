@@ -56,7 +56,7 @@ SOUL_PATH = Path(os.getenv("SOUL_PATH", "SOUL.md"))
 TOP_K = int(os.getenv("TOP_K", "4"))
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "512"))
 EMBEDDING_BACKEND = os.getenv("EMBEDDING_BACKEND", "hash").lower()
-AUTONOMOUS_INTERVAL_SEC = int(os.getenv("AUTONOMOUS_INTERVAL_SEC", "300"))
+AUTONOMOUS_INTERVAL_SEC = int(os.getenv("AUTONOMOUS_INTERVAL_SEC", "900"))
 WATCH_PATH = os.getenv("WATCH_PATH", ".")
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "10"))
 SHELL_LOG = Path(os.getenv("SHELL_LOG", ".agent/shell.log"))
@@ -1683,22 +1683,7 @@ def load_all_skills() -> str:
 _prompt_index = 0
 
 HEARTBEAT_PROMPTS = [
-    # Unfinished work
-    "What has the user asked you to do that isn't finished yet? Be specific and surface it.",
-    # Hardware awareness
-    "Run & summarize results: COMMAND: now",
-    # Todo check
-    "Is there a todo list? If so, read todo_list.txt and remind the user of anything incomplete.",
-    # Memory synthesis
-    "Review recent memory. What's the single most important thing the user is working on right now?",
-    # Open question
-    "Based on recent memory, what's one thing you're uncertain about that would help to clarify with the user?",
-    # File awareness
-    "What files have changed recently that the user might care about?",
-    # Reminder surface
-    "Did the user mention anything they wanted to follow up on later? Surface it now.",
-    # Curiosity
-    "You're curious about something the user mentioned recently. Search for it. SEARCH: <topic from memory>",
+    "COMMAND: now",
 ]
 
 
