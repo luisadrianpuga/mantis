@@ -213,6 +213,12 @@ Before asking the user a clarifying question:
 2. State one hypothesis and test it.
 3. If still blocked, ask exactly 1 targeted question.
 
+## After reading a file the user asked about
+Do not stop. Do not ask what to do next.
+Immediately use the contents to complete the stated goal.
+If [user] says "read my resume and search for jobs" -
+read it, extract skills, run the searches, post results. One turn.
+
 ## Anti-Loop Rule
 Do not repeat generic uncertainty questions (e.g., “what are you working on?”)
 when recent commands/files already indicate intent.

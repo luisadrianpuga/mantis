@@ -709,8 +709,8 @@ _history_lock = threading.Lock()
 
 
 def history_append(role: str, content: str, source: str = "user") -> None:
-    # only track user <-> agent exchanges, not tool/filesystem noise
-    if source not in {"user", "autonomous"}:
+    # Track user, autonomous, and tool exchanges; ignore low-signal noise lanes.
+    if source not in {"user", "autonomous", "tool"}:
         return
     with _history_lock:
         _chat_history.append({"role": role, "content": content})
