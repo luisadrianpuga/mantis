@@ -2287,8 +2287,22 @@ def act(context: dict) -> str:
         contents = read_file(read_path)
         ui_print(f"  ({len(contents)} chars)\n")
         discord_event("read", f"`{read_path}` ({len(contents)} chars)")
+
+        # Inject file contents into context and continue this turn.
+        enriched_input = (
+            f"{context['input']}\n\n"
+            f"[contents of {read_path}]:\n"
+            f"{_truncate_text(contents, 3000)}"
+        )
+        new_context = dict(context)
+        new_context["input"] = enriched_input
+        new_context["_read_depth"] = context.get("_read_depth", 0) + 1
+
+        # Guard against infinite read loops.
+        if new_context["_read_depth"] <= 3:
+            return act(new_context)
         attend(f"file contents of {read_path}:\n{contents}", source="tool")
-        reply = reply[: reply.index("READ:")].strip() or "(read file)"
+        return "(read file - max depth reached)"
 
     write_result = parse_write(reply)
     if write_result:
@@ -2346,8 +2360,21 @@ def act(context: dict) -> str:
         result = web_search(search_query)
         ui_print(f"  ({len(result)} chars)\n")
         discord_event("done", f"search returned {len(result)} chars")
+
+        # Inject search results into context and continue this turn.
+        enriched_input = (
+            f"{context['input']}\n\n"
+            f"[search results for '{search_query}']:\n"
+            f"{_truncate_text(result, 2000)}"
+        )
+        new_context = dict(context)
+        new_context["input"] = enriched_input
+        new_context["_search_depth"] = context.get("_search_depth", 0) + 1
+
+        if new_context["_search_depth"] <= 2:
+            return act(new_context)
         attend(f"search results: {result}", source="search")
-        reply = reply[: reply.index("SEARCH:")].strip() or "(searched)"
+        return "(searched - max depth reached)"
 
     fetch_url = parse_fetch(reply)
     if fetch_url:
@@ -2356,8 +2383,21 @@ def act(context: dict) -> str:
         result = web_fetch(fetch_url)
         ui_print(f"  ({len(result)} chars)\n")
         discord_event("done", f"fetch returned {len(result)} chars")
+
+        # Inject fetched content into context and continue this turn.
+        enriched_input = (
+            f"{context['input']}\n\n"
+            f"[fetched content from {fetch_url}]:\n"
+            f"{_truncate_text(result, 2000)}"
+        )
+        new_context = dict(context)
+        new_context["input"] = enriched_input
+        new_context["_fetch_depth"] = context.get("_fetch_depth", 0) + 1
+
+        if new_context["_fetch_depth"] <= 2:
+            return act(new_context)
         attend(f"fetched content from {fetch_url}:\n{result}", source="search")
-        reply = reply[: reply.index("FETCH:")].strip() or "(fetched)"
+        return "(fetched - max depth reached)"
 
     skill_source = parse_skill(reply)
     if skill_source:
@@ -2371,7 +2411,7 @@ def act(context: dict) -> str:
         attend(f"skill loaded: {result}", source="skill")
         reply = reply[: reply.index("SKILL:")].strip() or "(loaded skill)"
 
-    # store exchange in history (user and autonomous only)
+    # Store exchange in history.
     history_append("user", context["input"], source=source)
     history_append("assistant", reply, source=source)
 

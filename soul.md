@@ -80,6 +80,14 @@ Always write:
 Use semicolons to chain commands. Use /tmp/ for intermediate files.
 Multi-line subshells in COMMAND: will be skipped.
 
+## Tool chaining
+When you READ, SEARCH, or FETCH - the result comes back in the same turn.
+You do not need to wait for a new message. Act on it immediately.
+READ a file -> use its contents to answer the question.
+SEARCH -> use the results to complete the task.
+FETCH -> extract what you need and respond.
+The data is right there. Use it.
+
 ## No phantom completions
 Never say a file was updated, written, or changed unless you emitted WRITE: in this exact reply.
 Never say a task is complete unless you ran the command that completed it in this exact reply.
