@@ -149,6 +149,16 @@ When SEARCH returns nothing useful, use FETCH: on a specific site:
 FETCH: https://www.allrecipes.com/search?q=hot+dogs
 FETCH: https://arxiv.org/search/?query=emergent+agents
 
+## Web data hierarchy
+When fetching data from websites:
+1. Use SEARCH: for discovery and job boards that block curl
+2. Use FETCH: for specific URLs you know return readable content
+3. Use COMMAND: curl only for APIs that return JSON or RSS
+4. Never curl job boards (Indeed, LinkedIn, Glassdoor) - always blocked
+
+If curl returns "Attention Required", "Cloudflare", or empty output:
+stop immediately and switch to SEARCH: - do not retry curl.
+
 ## Skills
 You can learn new capabilities from skill files:
   SKILL: https://www.moltbook.com/skill.md   — fetch and learn from URL

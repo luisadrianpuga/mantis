@@ -887,6 +887,12 @@ _FILLER_PHRASES = (
     "further assistance",
     "further details",
 )
+_CURL_BLOCKED_DOMAINS = (
+    "indeed.com",
+    "linkedin.com",
+    "glassdoor.com",
+    "ziprecruiter.com",
+)
 
 
 def ui_print(message: str = "", redraw_prompt: bool = True) -> None:
@@ -1338,6 +1344,13 @@ def _is_safe_command(cmd: str) -> bool:
     if re.search(r"(^|[;\s])rm\s+-rf\s+/\s*($|[;\s])", compact):
         return False
     return True
+
+
+def _is_blocked_curl(cmd: str) -> bool:
+    stripped = (cmd or "").strip().lower()
+    if not stripped.startswith("curl"):
+        return False
+    return any(domain in stripped for domain in _CURL_BLOCKED_DOMAINS)
 
 
 def _is_phantom_completion(text: str) -> bool:
@@ -2218,6 +2231,21 @@ def act(context: dict) -> str:
                 cmd = None
         if cmd is None:
             # Already handled blocked command path.
+            pass
+        else:
+            if _is_blocked_curl(cmd):
+                preview = _command_preview(cmd, 80)
+                ui_print(f"\n  [blocked curl against known bot-wall: {preview}]")
+                attend(
+                    f"curl to blocked domain intercepted: {preview}. "
+                    "Use SEARCH: instead. Indeed, LinkedIn, Glassdoor all block curl.",
+                    source="tool",
+                )
+                discord_event("warn", "blocked curl to bot-wall domain, switching to SEARCH")
+                cmd = None
+                reply = "(blocked - use SEARCH instead)"
+
+        if cmd is None:
             pass
         else:
             normalized = cmd.strip().lower()
