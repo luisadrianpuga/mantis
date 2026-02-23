@@ -2166,6 +2166,15 @@ def act(context: dict) -> str:
     cmd = parse_command(reply)
     if not cmd:
         cmd = parse_command_fallback(reply)
+    # Redirect simple `cat <path>` to READ so file content stays in-turn.
+    if cmd:
+        try:
+            cat_parts = shlex.split(cmd.strip())
+        except ValueError:
+            cat_parts = []
+        if len(cat_parts) == 2 and cat_parts[0] == "cat":
+            cmd = None
+            reply = f"READ: {cat_parts[1]}"
     if cmd:
         if _is_incomplete_command(cmd):
             preview = _command_preview(cmd, 80)
