@@ -22,7 +22,7 @@ import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 import chromadb
 import httpx
 from dotenv import load_dotenv
@@ -223,6 +223,22 @@ _ensure_tasks_file()
 db = chromadb.PersistentClient(str(MEMORY_DIR))
 collection = db.get_or_create_collection("events")
 
+
+def prune_vector_memory(max_items: int = 5000) -> None:
+    """Keep Chroma collection bounded to avoid unbounded growth."""
+    try:
+        count = collection.count()
+        if count <= max_items:
+            return
+        to_delete = count - max_items
+        snapshot = collection.get()
+        ids = snapshot.get("ids", [])[:to_delete]
+        if ids:
+            collection.delete(ids=ids)
+    except Exception:
+        # Pruning must never break the runtime loop.
+        pass
+
 _encoder = None
 _encoder_lock = threading.Lock()
 
@@ -369,6 +385,16 @@ def store_command_outcome(
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (when, cmd[:4000], result[:4000], outcome, source, skill, duration_ms),
+        )
+        fts_conn.execute(
+            """
+            DELETE FROM command_outcomes
+            WHERE id NOT IN (
+                SELECT id FROM command_outcomes
+                ORDER BY id DESC
+                LIMIT 1000
+            )
+            """
         )
         fts_conn.commit()
     return outcome
@@ -605,6 +631,8 @@ def _guarded_skill_write(wpath: str, wcontent: str, reply: str) -> tuple[str, bo
 # -- MEMORY.md ----------------------------------------------------------------
 def md_append(text: str, source: str) -> None:
     ts = datetime.utcnow().isoformat()
+    if MEMORY_MD.exists() and MEMORY_MD.stat().st_size > 500_000:
+        MEMORY_MD.write_text("(memory rotated)\n", encoding="utf-8")
     line = f"\n- [{ts}] ({source}) {text[:300]}"
     with open(MEMORY_MD, "a", encoding="utf-8") as f:
         f.write(line)
@@ -779,12 +807,27 @@ class LaneQueue:
     """One queue per lane (source). Each lane processes serially."""
 
     def __init__(self):
-        self._lanes: dict[str, Queue] = defaultdict(Queue)
+        self._lanes: dict[str, Queue] = defaultdict(lambda: Queue(maxsize=100))
         self._locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
 
     def put(self, event: dict):
         lane = event.get("source", "user")
-        self._lanes[lane].put(event)
+        q = self._lanes[lane]
+
+        if q.full():
+            # Drop low-priority background lanes when saturated.
+            if lane in {"filesystem", "learning", "shell_journal"}:
+                return
+            # Keep high-priority lanes live by dropping oldest.
+            try:
+                q.get_nowait()
+            except Empty:
+                pass
+
+        try:
+            q.put_nowait(event)
+        except Full:
+            pass
 
     def drain(self) -> list[dict]:
         events = []
@@ -799,9 +842,18 @@ class LaneQueue:
     def lock(self, source: str) -> threading.Lock:
         return self._locks[source]
 
+    def clear_lane(self, source: str) -> None:
+        q = self._lanes[source]
+        while True:
+            try:
+                q.get_nowait()
+            except Empty:
+                break
+
 
 lane_queue = LaneQueue()
 _event_loop_stop = threading.Event()
+_system_busy = threading.Event()
 _watcher_started = False
 _watcher_lock = threading.Lock()
 _last_seen_fs: dict[str, float] = {}
@@ -823,6 +875,9 @@ _RECENT_INPUT_WINDOW = 5
 _last_event_loop_error_msg = ""
 _last_event_loop_error_ts = 0.0
 _suppressed_event_loop_errors = 0
+_chaos_counter = 0
+_autonomous_paused_until = 0.0
+_memory_maintenance_counter = 0
 _META_REPLIES = {
     "(running...)",
     "(ran command)",
@@ -1498,6 +1553,7 @@ def _repair_command_once(
             ),
         },
     ]
+    _system_busy.set()
     try:
         r = httpx.post(
             f"{LLM_BASE}/chat/completions",
@@ -1508,6 +1564,8 @@ def _repair_command_once(
         content = r.json()["choices"][0]["message"]["content"].strip()
     except Exception:
         return None
+    finally:
+        _system_busy.clear()
 
     repaired = parse_command(content) or parse_command_fallback(content)
     if not repaired:
@@ -1803,6 +1861,10 @@ def autonomous_loop():
         _event_loop_stop.wait(AUTONOMOUS_INTERVAL_SEC)
         if _event_loop_stop.is_set():
             break
+        if _system_busy.is_set():
+            continue
+        if time.time() < _autonomous_paused_until:
+            continue
         attend(next_heartbeat_prompt(), source="autonomous")
 
 
@@ -1812,6 +1874,10 @@ def task_scheduler_loop():
         _event_loop_stop.wait(60)
         if _event_loop_stop.is_set():
             break
+        if _system_busy.is_set():
+            continue
+        if time.time() < _autonomous_paused_until:
+            continue
         try:
             now = datetime.utcnow()
             tasks = load_tasks()
@@ -1827,6 +1893,8 @@ def task_scheduler_loop():
                     if now >= next_fire:
                         ui_print(f"\n[tasks] firing: {name}\n")
                         discord_event("task", f"task fired: {name}")
+                        if _system_busy.is_set():
+                            continue
                         attend(task["prompt"], source="autonomous")
                         _task_fire_times[name] = _next_fire(task["schedule"], now)
         except Exception as e:
@@ -1897,6 +1965,8 @@ def start_watcher():
                             cmd_part = last.split("[you]:", 1)[-1].strip()
                             if _is_shell_journal_noise(cmd_part):
                                 return
+                            if _system_busy.is_set():
+                                return
                             attend(f"you ran in terminal: {last}", source="shell_journal")
                 except Exception:
                     pass
@@ -1913,6 +1983,8 @@ def start_watcher():
                 try:
                     content = Path(path).read_text(encoding="utf-8").strip()
                     if content:
+                        if _system_busy.is_set():
+                            return
                         attend(
                             f"new skill available: {Path(path).stem}\n{content[:300]}",
                             source="skill",
@@ -1924,6 +1996,8 @@ def start_watcher():
             if _should_ignore_fs_path(path):
                 return
             if _debounced_fs_path(path):
+                return
+            if _system_busy.is_set():
                 return
             attend(f"file {event_type}: {path}", source="filesystem")
 
@@ -1980,9 +2054,14 @@ def _report_event_loop_error(err: Exception) -> None:
     global _last_event_loop_error_msg
     global _last_event_loop_error_ts
     global _suppressed_event_loop_errors
+    global _chaos_counter
 
     now = time.time()
     msg = str(err).strip() or err.__class__.__name__
+    _chaos_counter += 1
+    if _chaos_counter >= 5:
+        enter_chaos_mode()
+
     same_error = msg == _last_event_loop_error_msg and (now - _last_event_loop_error_ts) < 10
 
     if same_error:
@@ -1996,6 +2075,18 @@ def _report_event_loop_error(err: Exception) -> None:
     _last_event_loop_error_msg = msg
     _last_event_loop_error_ts = now
     ui_print(f"\n[error] event loop recovered: {msg}\n")
+
+
+def enter_chaos_mode() -> None:
+    global _chaos_counter
+    global _autonomous_paused_until
+
+    _chaos_counter = 0
+    _autonomous_paused_until = time.time() + 300
+    for source in BACKGROUND_SOURCES:
+        lane_queue.clear_lane(source)
+    ui_print("[chaos mode] background cleared; autonomous paused for 5 minutes")
+    discord_event("warn", "CHAOS MODE: background queues cleared, autonomous paused 5m")
 
 
 def event_loop():
@@ -2020,9 +2111,15 @@ def attend(text: str, source: str = "user"):
 
 # -- Rule 2: ASSOCIATE --------------------------------------------------------
 def associate(event: dict) -> dict | None:
+    global _memory_maintenance_counter
+
     text = event["text"]
     source = event.get("source", "user")
     ts = event["ts"]
+
+    _memory_maintenance_counter += 1
+    if _memory_maintenance_counter % 200 == 0:
+        prune_vector_memory()
 
     # Drop duplicate autonomous/tool inputs to prevent heartbeat pileups.
     if source in {"autonomous", "tool"} and _is_duplicate_input(text):
@@ -2135,6 +2232,7 @@ def act(context: dict) -> str:
         max_total_chars=MAX_PROMPT_CHARS,
     )
 
+    _system_busy.set()
     try:
         r = httpx.post(
             f"{LLM_BASE}/chat/completions",
@@ -2175,6 +2273,8 @@ def act(context: dict) -> str:
         return f"(llm request error: {e})"
     except Exception as e:
         return f"(llm error: {e})"
+    finally:
+        _system_busy.clear()
 
     cmd = parse_command(reply)
     if not cmd:
